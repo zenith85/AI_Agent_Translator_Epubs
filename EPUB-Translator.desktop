@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=EPUB Translator
+Comment=Translate an EPUB with Claude, formatting intact
+Exec=/home/ibraheem/AI_Par_Ser_Trans/run_gui.sh
+Path=/home/ibraheem/AI_Par_Ser_Trans
+Terminal=false
+Icon=accessories-dictionary
+Categories=Utility;
