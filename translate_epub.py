@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Translate an EPUB chapter-by-chapter (packed to fit Claude's context) using the
-Claude Code CLI (`claude -p`) -- no separate Anthropic API key needed, rides your
-existing Claude Code login.
+"""Translate an EPUB chapter-by-chapter (packed to fit context) using either the
+Claude Code CLI (`claude -p`) or the Codex CLI (`codex exec`) -- no separate API
+key needed either way, rides whichever CLI's existing login you already have.
 
-This script checks its own prerequisites (the `claude` CLI installed, you logged in,
-and the local Python dependencies present) and fixes what it can before doing any
-translation work, so it can be handed to a fresh machine without manual setup."""
+This script checks its own prerequisites (the chosen engine's CLI installed, you
+logged in, and the local Python dependencies present) and fixes what it can
+before doing any translation work, so it can be handed to a fresh machine
+without manual setup."""
 
 from __future__ import annotations
 
@@ -17,30 +18,37 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import claude_driver  # stdlib-only, safe to import before dependency checks
+import codex_driver  # stdlib-only, safe to import before dependency checks
 import preflight  # stdlib-only, safe to import before dependency checks
+import translation_common  # stdlib-only, safe to import before dependency checks
+
+DRIVERS = {"claude": claude_driver, "codex": codex_driver}
 
 
-def _ensure_claude_installed() -> None:
-    if not preflight.is_claude_installed():
-        print(preflight.CLAUDE_INSTALL_HINT + "\nThen re-run this script.", file=sys.stderr)
+def _ensure_engine_installed(engine: str) -> None:
+    info = preflight.ENGINES[engine]
+    if not info["is_installed"]():
+        print(info["cli_hint"] + "\nThen re-run this script.", file=sys.stderr)
         sys.exit(1)
 
 
-def _ensure_claude_logged_in() -> None:
-    status = preflight.claude_auth_status()
+def _ensure_engine_logged_in(engine: str) -> None:
+    info = preflight.ENGINES[engine]
+    status = info["auth_status"]()
     if status.get("loggedIn"):
         return
 
-    print("Claude Code isn't logged in yet -- launching `claude auth login`...")
-    status = preflight.claude_login()  # interactive: inherits this terminal, may open a browser
+    print(f"{info['label']} isn't logged in yet -- launching its login flow...")
+    status = info["login"]()  # interactive: inherits this terminal, may open a browser
 
     if not status.get("loggedIn"):
         print(
-            "error: still not logged in. Run `claude auth login` yourself, then re-run this script.",
+            f"error: still not logged in to {info['label']}. Log in yourself, then re-run this script.",
             file=sys.stderr,
         )
         sys.exit(1)
-    print(f"Logged in as {status.get('email', 'your account')}.")
+    detail = status.get("email") or status.get("detail") or "your account"
+    print(f"Logged in to {info['label']} as {detail}.")
 
 
 def _ensure_dependencies() -> None:
@@ -66,11 +74,13 @@ def derive_output_path(source: Path, target_lang: str, explicit: str) -> Path:
 
 
 BANNER = r"""
-+----------------------------------------+
-|            EPUB Translator             |
-|          (powered by Claude)           |
-+----------------------------------------+
++--------------------------------+
+|    INNO AI Agent Translator    |
+|  (powered by Claude or Codex)  |
++--------------------------------+
 """
+
+ENGINE_CHOICES = ["claude", "codex"]
 
 COMMON_LANGUAGES = [
     "Spanish",
@@ -97,10 +107,21 @@ def _menu_choice(prompt: str, option_count: int) -> int:
         print(f"  Please enter a number from 1 to {option_count}.")
 
 
+def _prompt_for_engine() -> str:
+    print("Step 1: which engine should translate?")
+    print()
+    for i, key in enumerate(ENGINE_CHOICES, start=1):
+        print(f"  {i}) {preflight.ENGINES[key]['label']}")
+    print()
+    choice = _menu_choice("> ", len(ENGINE_CHOICES))
+    return ENGINE_CHOICES[choice - 1]
+
+
 def _prompt_for_epub_path() -> Path:
     candidates = sorted(Path.cwd().glob("*.epub"))
 
-    print("Step 1: which file needs translation?")
+    print()
+    print("Step 2: which file needs translation?")
     print()
     for i, c in enumerate(candidates, start=1):
         print(f"  {i}) {c.name}")
@@ -123,9 +144,33 @@ def _prompt_for_epub_path() -> Path:
         print(f"  '{raw}' doesn't exist, try again.")
 
 
+def _prompt_for_source_lang() -> str:
+    print()
+    print("Step 3: translate from which language? (default: let it figure that out itself)")
+    print()
+    print(f"   1) {translation_common.AUTO_DETECT}")
+    for i, lang in enumerate(COMMON_LANGUAGES, start=2):
+        print(f"  {i:>2}) {lang}")
+    other_option = len(COMMON_LANGUAGES) + 2
+    print(f"  {other_option:>2}) Other (type it in)")
+    print()
+
+    choice = _menu_choice("> ", other_option)
+    if choice == 1:
+        return translation_common.AUTO_DETECT
+    if choice != other_option:
+        return COMMON_LANGUAGES[choice - 2]
+
+    while True:
+        raw = input("Language: ").strip()
+        if raw:
+            return raw
+        print("  Please enter a language.")
+
+
 def _prompt_for_target_lang() -> str:
     print()
-    print("Step 2: translate to which language?")
+    print("Step 4: translate to which language?")
     print()
     for i, lang in enumerate(COMMON_LANGUAGES, start=1):
         print(f"  {i:>2}) {lang}")
@@ -144,59 +189,74 @@ def _prompt_for_target_lang() -> str:
         print("  Please enter a language.")
 
 
-def _confirm(source: Path, target_lang: str) -> bool:
+def _confirm(source: Path, source_lang: str, target_lang: str, engine: str) -> bool:
     print()
-    answer = input(f"Translate '{source.name}' -> {target_lang}? [Y/n] ").strip().lower()
+    label = preflight.ENGINES[engine]["label"]
+    if translation_common.is_auto_detect(source_lang):
+        question = f"Translate '{source.name}' -> {target_lang} using {label}? [Y/n] "
+    else:
+        question = f"Translate '{source.name}' from {source_lang} to {target_lang} using {label}? [Y/n] "
+    answer = input(question).strip().lower()
     return answer in ("", "y", "yes")
 
 
 def main():
-    _ensure_claude_installed()
     _ensure_dependencies()
-    _ensure_claude_logged_in()
 
     import epub_io  # deferred until _ensure_dependencies() has confirmed/installed bs4, lxml, ebooklib
 
-    parser = argparse.ArgumentParser(description="Translate an EPUB using the Claude Code CLI.")
+    parser = argparse.ArgumentParser(description="Translate an EPUB using Claude or Codex.")
     parser.add_argument("epub", nargs="?", default=None,
                          help="Path to the source .epub file (omit to be asked)")
     parser.add_argument("--to", dest="target_lang", default=None,
                          help='Target language, e.g. "French", "Brazilian Portuguese" (omit to be asked)')
+    parser.add_argument("--from", dest="source_lang", default=None,
+                         help='Source language, e.g. "Spanish" (default: let the engine auto-detect it)')
+    parser.add_argument("--engine", choices=ENGINE_CHOICES, default=None,
+                         help="Which CLI to translate with: claude or codex (omit to be asked)")
     parser.add_argument("-o", "--output", default="",
                          help="Output .epub path (default: <name>.<lang>.epub next to the source)")
     parser.add_argument("--max-tokens-per-chunk", type=int, default=6000,
                          help="Approx. input tokens packed per translation call (default: 6000)")
     parser.add_argument("--model", default=None,
-                         help="Model alias/name passed to `claude -p --model` (default: your account's default model)")
+                         help="Model alias/name passed to the engine's CLI (default: its account's default model)")
     parser.add_argument("--concurrency", type=int, default=3,
                          help="Number of chunks to translate in parallel (default: 3)")
     parser.add_argument("--dry-run", action="store_true",
                          help="Parse and chunk the book, print the plan, and exit without translating")
     args = parser.parse_args()
 
-    interactive = not (args.epub and args.target_lang)
+    interactive = not (args.epub and args.target_lang and args.engine)
 
     try:
         if interactive:
             print(BANNER)
         while True:
+            engine = args.engine or _prompt_for_engine()
             source = Path(args.epub) if args.epub else _prompt_for_epub_path()
             if not source.exists():
                 print(f"error: {source} not found", file=sys.stderr)
                 sys.exit(1)
+            source_lang = args.source_lang
+            if source_lang is None:
+                source_lang = _prompt_for_source_lang() if interactive else translation_common.AUTO_DETECT
             target_lang = args.target_lang or _prompt_for_target_lang()
 
-            if not interactive or _confirm(source, target_lang):
+            if not interactive or _confirm(source, source_lang, target_lang, engine):
                 break
             print("\nLet's try again.\n")
     except (EOFError, KeyboardInterrupt):
         print("\nCancelled.", file=sys.stderr)
         sys.exit(1)
 
+    _ensure_engine_installed(engine)
+    _ensure_engine_logged_in(engine)
+    driver = DRIVERS[engine]
+
     print(f"Parsing {source.name}...")
     book = epub_io.load_book(str(source))
-    chunks = claude_driver.pack_chunks(book.units, args.max_tokens_per_chunk)
-    total_tokens = sum(claude_driver.estimate_tokens(u.html) for u in book.units)
+    chunks = translation_common.pack_chunks(book.units, args.max_tokens_per_chunk)
+    total_tokens = sum(translation_common.estimate_tokens(u.html) for u in book.units)
     pages = epub_io.estimate_pages(book.units)
     print(
         f"{len(book.chapters)} chapter(s), ~{pages} page(s), {len(book.units)} translation unit(s), "
@@ -205,7 +265,7 @@ def main():
 
     if args.dry_run:
         for i, chunk in enumerate(chunks, start=1):
-            chunk_tokens = sum(claude_driver.estimate_tokens(u.html) for u in chunk)
+            chunk_tokens = sum(translation_common.estimate_tokens(u.html) for u in chunk)
             print(f"  chunk {i}: {len(chunk)} unit(s), ~{chunk_tokens} tokens")
         return
 
@@ -216,7 +276,7 @@ def main():
         completed = 0
 
         def work(index, chunk):
-            translations, error = claude_driver.translate_chunk(chunk, target_lang, args.model)
+            translations, error = driver.translate_chunk(chunk, target_lang, args.model, source_lang=source_lang)
             return index, chunk, translations, error
 
         start = time.time()

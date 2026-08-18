@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
-"""Drag-and-drop GUI for translating an EPUB via the Claude Code CLI.
+"""Drag-and-drop GUI for translating an EPUB via the Claude Code or Codex CLI.
 
 Bootstraps its own dependencies (tkinterdnd2 for drag-and-drop, tkinterweb for
 the rendered preview, plus the epub parsing libraries) the same way
 translate_epub.py does, then shows a window: drop or browse for an .epub,
-pick a language, click Translate. Once translated, every chunk shows up in a
-list on the left with its own Re-translate button; clicking a chunk renders
-its current (translated) HTML in a preview pane on the right.
+pick an engine and a language, click Translate. Once translated, every chunk
+shows up in a list on the left with its own Re-translate button (which uses
+whichever engine is currently selected, so a chunk can be retried with the
+other engine); clicking a chunk renders its current (translated) HTML in a
+preview pane on the right.
 
-Threading model: worker threads only ever call claude_driver (network-bound,
-side-effect-free) and hand results back over a queue. All BeautiffulSoup tree
-mutation (epub_io.apply_translations) and epub writing happen on the main
-thread (in response to queued messages), so nothing races with the preview
-pane reading the same tree."""
+Threading model: worker threads only ever call claude_driver/codex_driver
+(network-bound, side-effect-free) and hand results back over a queue. All
+BeautifulSoup tree mutation (epub_io.apply_translations) and epub writing
+happen on the main thread (in response to queued messages), so nothing races
+with the preview pane reading the same tree."""
 
 from __future__ import annotations
 
@@ -26,9 +28,28 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+import claude_driver  # stdlib-only, safe to import before dependency checks
+import codex_driver  # stdlib-only, safe to import before dependency checks
+import local_ai_driver  # stdlib-only, safe to import before dependency checks
 import preflight  # stdlib-only, safe to import before dependency checks
+import translation_common  # stdlib-only, safe to import before dependency checks
 
-GUI_DEPS = [("tkinterdnd2", "tkinterdnd2"), ("tkinterweb", "tkinterweb")] + preflight.EPUB_DEPS
+GUI_DEPS = [
+    ("tkinterdnd2", "tkinterdnd2"),
+    ("tkinterweb", "tkinterweb"),
+    ("ttkbootstrap", "ttkbootstrap"),
+] + preflight.EPUB_DEPS
+
+THEME = "superhero"
+APP_NAME = "INNO AI Agent Translator"
+
+# claude/codex ride an existing CLI login (checked via preflight.ENGINES); local_ai has no
+# such thing -- it's a plain HTTP client against a URL/key the user configures themselves,
+# so it's handled separately wherever engine-specific setup/readiness logic comes up.
+DRIVERS = {"claude": claude_driver, "codex": codex_driver, "local_ai": local_ai_driver}
+ENGINE_KEYS = ["claude", "codex", "local_ai"]
+ENGINE_LABELS = {**{key: preflight.ENGINES[key]["label"] for key in ("claude", "codex")}, "local_ai": "Local AI"}
+ENGINE_KEYS_BY_LABEL = {label: key for key, label in ENGINE_LABELS.items()}
 
 COMMON_LANGUAGES = [
     "Spanish", "French", "German", "Italian", "Portuguese (Brazil)",
@@ -39,10 +60,10 @@ MAX_TOKENS_PER_CHUNK = 6000
 CONCURRENCY = 3
 
 STATUS_LABELS = {
-    "queued": ("queued", "#999999"),
-    "translating": ("translating…", "#b8860b"),
-    "done": ("done", "#2a7a2a"),
-    "failed": ("failed", "#b3261e"),
+    "queued": ("queued", "secondary"),
+    "translating": ("translating…", "warning"),
+    "done": ("done", "success"),
+    "failed": ("failed", "danger"),
 }
 
 
@@ -111,20 +132,28 @@ class ChunkInfo:
 class App:
     def __init__(self, root):
         self.root = root
-        self.root.title("EPUB Translator")
-        self.root.geometry("960x640")
-        self.root.minsize(800, 520)
+        self.root.title(APP_NAME)
+        self.root.geometry("1080x640")
+        self.root.minsize(860, 520)
 
         self.source_path = None
         self.msg_queue = queue.Queue()
         self.full_translate_active = False
-        self._claude_ready = False
+        self._engine_ready = False
+        self._checked_engine = None  # which engine the last status check was for
+
+        # Local AI has no CLI login -- just a URL/key/model the user configures via the
+        # gear icon. Kept in memory only for this session, never written to disk.
+        self.local_ai_base_url = ""
+        self.local_ai_api_key = ""
+        self.local_ai_model = ""
 
         self.book = None
         self.chunks = []  # list[ChunkInfo]
         self.selected_chunk = None
         self.output_path = None
         self.target_lang = ""
+        self.source_lang = ""
         self._write_lock = threading.Lock()
 
         self._start_time = None
@@ -135,31 +164,94 @@ class App:
 
         self._build_ui()
         self._poll_queue()
-        self._check_claude_async()
+        self._check_engine_async(self._engine_key())
 
     # ---- UI construction ----
 
     def _build_ui(self):
-        pad = {"padx": 16, "pady": 8}
+        import ttkbootstrap as tb
 
-        ttk.Label(self.root, text="EPUB Translator", font=("", 16, "bold")).pack(pady=(16, 0))
-        ttk.Label(self.root, text="Translate a book with Claude, formatting intact.",
-                  foreground="#666").pack(pady=(0, 8))
+        colors = tb.Style().colors
 
-        self.claude_status_var = tk.StringVar(value="Checking Claude Code...")
-        self.claude_status_label = ttk.Label(self.root, textvariable=self.claude_status_var,
-                                              foreground="#666", wraplength=880, justify="left")
-        self.claude_status_label.pack(padx=16, pady=(0, 4), fill="x")
+        # Two-column layout: a fixed-width sidebar on the left holds the setup controls
+        # (engine, login, from/to language, save-as) -- none of that needs to stretch
+        # across the whole window, it was just filling the space because it was the only
+        # thing in a full-width row. The chunk list + preview -- the "chapters and
+        # details" that actually grow with the book -- get the rest of the window on
+        # the right, full height, instead of being squeezed into a strip at the bottom.
+        main = tb.Frame(self.root)
+        main.pack(fill="both", expand=True)
 
-        self.login_button = ttk.Button(self.root, text="Log in to Claude Code", command=self._start_login)
+        sidebar = tb.Frame(main, width=320, padding=(20, 20, 12, 20))
+        sidebar.pack(side="left", fill="y")
+        sidebar.pack_propagate(False)
 
-        # Drop zone
-        self.drop_frame = tk.Frame(self.root, bg="#f4f4f6", highlightbackground="#bbbbbb",
-                                    highlightthickness=2, height=90)
-        self.drop_frame.pack(fill="x", padx=16, pady=8)
-        self.drop_label = tk.Label(self.drop_frame, text="Drag an .epub file here\nor click to browse",
-                                    bg="#f4f4f6", fg="#555555", cursor="hand2")
-        self.drop_label.pack(expand=True, fill="both", pady=20)
+        content = tb.Frame(main, padding=(8, 20, 20, 20))
+        content.pack(side="left", fill="both", expand=True)
+
+        # Header
+        tb.Label(sidebar, text=APP_NAME, font=("", 16, "bold"),
+                 wraplength=280, justify="left").pack(anchor="w")
+        tb.Label(sidebar, text="Claude, Codex, or a local model -- formatting intact.",
+                 bootstyle="secondary", wraplength=280, justify="left").pack(anchor="w", pady=(2, 16))
+
+        # Setup card: engine (+ its status/login), language, output filename
+        setup = tb.Labelframe(sidebar, text="Setup", padding=14)
+        setup.pack(fill="x", pady=(0, 12))
+        setup.columnconfigure(1, weight=1)
+
+        tb.Label(setup, text="Engine").grid(row=0, column=0, sticky="w", padx=(0, 12), pady=(0, 8))
+        self.engine_var = tk.StringVar(value=ENGINE_LABELS["claude"])
+        self.engine_combo = tb.Combobox(setup, textvariable=self.engine_var, state="readonly",
+                                         values=[ENGINE_LABELS[k] for k in ENGINE_KEYS])
+        self.engine_combo.grid(row=0, column=1, sticky="ew", pady=(0, 8))
+        self.engine_var.trace_add("write", lambda *_: self._on_engine_changed())
+
+        self.engine_settings_button = tb.Button(setup, text="⚙", width=3, bootstyle="secondary-outline",
+                                                  command=self._open_local_ai_settings)
+        self.engine_settings_button.grid(row=0, column=2, padx=(6, 0), pady=(0, 8))
+        self.engine_settings_button.grid_remove()
+
+        self.engine_status_var = tk.StringVar(value="Checking...")
+        self.engine_status_label = tb.Label(setup, textvariable=self.engine_status_var,
+                                             bootstyle="secondary", wraplength=280, justify="left")
+        self.engine_status_label.grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 4))
+
+        self.login_button = tb.Button(setup, text="Log in", bootstyle="warning", command=self._start_login,
+                                       state="disabled")
+        self.login_button.grid(row=2, column=0, columnspan=3, sticky="w", pady=(0, 4))
+
+        tb.Separator(setup).grid(row=3, column=0, columnspan=3, sticky="ew", pady=8)
+
+        tb.Label(setup, text="From").grid(row=4, column=0, sticky="w", padx=(0, 12), pady=(0, 8))
+        self.source_lang_var = tk.StringVar(value=translation_common.AUTO_DETECT)
+        self.source_lang_combo = tb.Combobox(setup, textvariable=self.source_lang_var,
+                                              values=[translation_common.AUTO_DETECT] + COMMON_LANGUAGES)
+        self.source_lang_combo.grid(row=4, column=1, sticky="ew", pady=(0, 8))
+
+        tb.Label(setup, text="To").grid(row=5, column=0, sticky="w", padx=(0, 12), pady=(0, 8))
+        self.lang_var = tk.StringVar()
+        self.lang_combo = tb.Combobox(setup, textvariable=self.lang_var, values=COMMON_LANGUAGES)
+        self.lang_combo.grid(row=5, column=1, sticky="ew", pady=(0, 8))
+        self.lang_var.trace_add("write", lambda *_: self._on_language_changed())
+
+        tb.Label(setup, text="Save as").grid(row=6, column=0, sticky="w", padx=(0, 12))
+        self.output_name_var = tk.StringVar()
+        self._last_auto_name = ""
+        self.output_name_entry = tb.Entry(setup, textvariable=self.output_name_var)
+        self.output_name_entry.grid(row=6, column=1, sticky="ew")
+
+        # Drop zone -- uses inputbg/secondary rather than light/border: those two are
+        # reliably distinct from the page background in both light and dark themes,
+        # whereas border in particular is literally identical to bg in dark themes
+        # (verified for "darkly": both #222222), which made the box invisible.
+        self.drop_frame = tk.Frame(sidebar, bg=colors.inputbg, highlightbackground=colors.secondary,
+                                    highlightthickness=1, height=88)
+        self.drop_frame.pack(fill="x", pady=8)
+        self.drop_label = tk.Label(self.drop_frame, text="Drag an .epub file here, or click to browse",
+                                    bg=colors.inputbg, fg=colors.secondary, font=("", 11), cursor="hand2",
+                                    wraplength=270, justify="center")
+        self.drop_label.pack(expand=True, fill="both", pady=14)
         self.drop_label.bind("<Button-1>", lambda e: self._browse())
         self.drop_frame.bind("<Button-1>", lambda e: self._browse())
 
@@ -171,74 +263,82 @@ class App:
         except Exception:
             pass  # drag-and-drop unavailable; clicking to browse still works
 
-        # Language picker
-        lang_row = ttk.Frame(self.root)
-        lang_row.pack(fill="x", **pad)
-        ttk.Label(lang_row, text="Translate to:").pack(side="left")
-        self.lang_var = tk.StringVar()
-        self.lang_combo = ttk.Combobox(lang_row, textvariable=self.lang_var, values=COMMON_LANGUAGES)
-        self.lang_combo.pack(side="left", fill="x", expand=True, padx=(8, 0))
-        self.lang_var.trace_add("write", lambda *_: self._on_language_changed())
+        self.translate_button = tb.Button(sidebar, text="Translate", bootstyle="primary",
+                                           command=self._on_translate, state="disabled")
+        self.translate_button.pack(fill="x", pady=(6, 10))
 
-        # Output filename -- pre-filled with a suggested name, freely editable
-        name_row = ttk.Frame(self.root)
-        name_row.pack(fill="x", **pad)
-        ttk.Label(name_row, text="Save as:").pack(side="left")
-        self.output_name_var = tk.StringVar()
-        self._last_auto_name = ""
-        self.output_name_entry = ttk.Entry(name_row, textvariable=self.output_name_var)
-        self.output_name_entry.pack(side="left", fill="x", expand=True, padx=(8, 0))
-
-        self.translate_button = ttk.Button(self.root, text="Translate", command=self._on_translate,
-                                            state="disabled")
-        self.translate_button.pack(pady=(8, 4))
-
-        self.progress = ttk.Progressbar(self.root, mode="determinate")
-        self.progress.pack(fill="x", padx=16, pady=(4, 4))
+        self.progress = tb.Progressbar(sidebar, mode="determinate", bootstyle="primary")
+        self.progress.pack(fill="x", pady=(0, 4))
 
         self.status_var = tk.StringVar(value="")
-        ttk.Label(self.root, textvariable=self.status_var, foreground="#666").pack(padx=16, anchor="w")
+        tb.Label(sidebar, textvariable=self.status_var, bootstyle="secondary",
+                 wraplength=280, justify="left").pack(anchor="w", fill="x", pady=(0, 8))
 
-        # Chunk list (left) + rendered preview (right)
-        paned = ttk.PanedWindow(self.root, orient="horizontal")
-        paned.pack(fill="both", expand=True, padx=16, pady=(8, 16))
+        # Chunk list (left) + rendered preview (right) -- "chapters and details" for
+        # the loaded book, filling the entire right side of the window.
+        paned = tb.PanedWindow(content, orient="horizontal")
+        paned.pack(fill="both", expand=True)
 
-        chunks_container = ttk.Frame(paned)
+        chunks_container = tb.Frame(paned)
         paned.add(chunks_container, weight=2)
 
-        self.chunks_canvas = tk.Canvas(chunks_container, highlightthickness=0, bg="#ffffff")
-        chunks_scrollbar = ttk.Scrollbar(chunks_container, orient="vertical", command=self.chunks_canvas.yview)
-        self.chunks_inner = ttk.Frame(self.chunks_canvas)
+        # ttk.Panedwindow sizes each pane from its requested/natural size on first
+        # layout (weight= only governs how *extra* space is redistributed on later
+        # resizes), and a bare Canvas has no natural width of its own -- without an
+        # explicit width hint here the initial split can leave this pane too narrow
+        # to fit a row's status badge and Retry button.
+        self.chunks_canvas = tk.Canvas(chunks_container, highlightthickness=0, bg=colors.bg, width=420)
+        chunks_scrollbar = tb.Scrollbar(chunks_container, orient="vertical", command=self.chunks_canvas.yview)
+        self.chunks_inner = tb.Frame(self.chunks_canvas)
         self.chunks_inner.bind(
             "<Configure>",
             lambda e: self.chunks_canvas.configure(scrollregion=self.chunks_canvas.bbox("all")),
         )
         self.chunks_window_id = self.chunks_canvas.create_window((0, 0), window=self.chunks_inner, anchor="nw")
-        # Keep the inner frame's width tied to the canvas's actual visible width, so rows
-        # use the real available space instead of clipping at whatever width they'd naturally
-        # request (the canvas doesn't do this on its own for an embedded window).
-        self.chunks_canvas.bind(
-            "<Configure>",
-            lambda e: self.chunks_canvas.itemconfig(self.chunks_window_id, width=e.width),
-        )
+
+        def _on_chunks_canvas_resize(event):
+            # Keep the inner frame's width tied to the canvas's actual visible width, so rows
+            # use the real available space instead of clipping at whatever width they'd
+            # naturally request (the canvas doesn't do this on its own for an embedded window).
+            self.chunks_canvas.itemconfig(self.chunks_window_id, width=event.width)
+            # The placeholder's wraplength must track the same real width, or it clips
+            # instead of wrapping whenever the pane is narrower than a hardcoded guess.
+            self.chunks_placeholder.config(wraplength=max(80, event.width - 16))
+
+        self.chunks_canvas.bind("<Configure>", _on_chunks_canvas_resize)
         self.chunks_canvas.configure(yscrollcommand=chunks_scrollbar.set)
         self.chunks_canvas.pack(side="left", fill="both", expand=True)
         chunks_scrollbar.pack(side="right", fill="y")
         self._bind_scroll(self.chunks_canvas)
 
-        self.chunks_placeholder = ttk.Label(
+        self.chunks_placeholder = tb.Label(
             self.chunks_inner, text="Chunks will appear here once you click Translate.",
-            foreground="#999", wraplength=260, justify="left",
+            bootstyle="secondary", wraplength=260, justify="left",
         )
         self.chunks_placeholder.pack(padx=8, pady=8, anchor="w")
 
-        preview_container = ttk.Frame(paned)
+        # A visible border around the preview frame: the HTML preview stays a plain
+        # white/light "page" regardless of app theme (book content reads best on a
+        # neutral light background), so it needs a clear frame around it in a dark
+        # theme -- otherwise it looks like a stray rendering glitch instead of a
+        # deliberate reading pane.
+        preview_container = tk.Frame(paned, highlightbackground=colors.secondary, highlightthickness=1)
         paned.add(preview_container, weight=2)
 
         from tkinterweb import HtmlFrame
-        self.preview_frame = HtmlFrame(preview_container, messages_enabled=False)
+        # width/height are just initial-layout hints (pack(fill="both", expand=True)
+        # below still lets it grow to whatever the pane actually gets) -- tkinterweb's
+        # default requested size is ~800x600, which is bigger than the chunk list's,
+        # so with equal pane weights below, ttk.Panedwindow's deficit-splitting (equal
+        # weight = equal absolute pixels trimmed from each pane's *requested* size, not
+        # proportional) crushed the narrower chunk-list pane down to ~140px before this.
+        self.preview_frame = HtmlFrame(preview_container, messages_enabled=False, width=300, height=200)
         self.preview_frame.pack(fill="both", expand=True)
-        self.preview_frame.load_html("<html><body></body></html>")
+        # Only tinted while empty -- once there's real translated content to show,
+        # it switches to a plain light page (book text reads best that way), but an
+        # unused panel showing stark white next to a dark theme looks like a bug.
+        self._preview_bg = colors.bg
+        self._render_preview_empty()
 
     def _bind_scroll(self, widget):
         def on_wheel(event):
@@ -304,33 +404,155 @@ class App:
         except Exception:
             pass  # not fatal -- Translate will surface a real error if the file is actually bad
 
-    # ---- claude status ----
+    # ---- engine status ----
 
-    def _check_claude_async(self):
+    def _engine_key(self) -> str:
+        return ENGINE_KEYS_BY_LABEL.get(self.engine_var.get(), "claude")
+
+    def _on_engine_changed(self):
+        engine = self._engine_key()
+        self._engine_ready = False
+        self._update_translate_state()
+
+        if engine == "local_ai":
+            self.login_button.grid_remove()
+            self.engine_settings_button.grid()
+            self._refresh_local_ai_status()
+        else:
+            self.engine_settings_button.grid_remove()
+            self.login_button.grid()
+            self.login_button.config(state="disabled")
+            self.engine_status_var.set("Checking...")
+            self._check_engine_async(engine)
+
+    def _check_engine_async(self, engine: str):
+        info = preflight.ENGINES[engine]
+
         def work():
-            if not preflight.is_claude_installed():
-                self.msg_queue.put(("claude_status", "not_installed", None))
+            if not info["is_installed"]():
+                self.msg_queue.put(("engine_status", (engine, "not_installed", None)))
                 return
-            status = preflight.claude_auth_status()
+            status = info["auth_status"]()
             if status.get("loggedIn"):
-                self.msg_queue.put(("claude_status", "ok", status.get("email", "")))
+                detail = status.get("email") or status.get("detail") or ""
+                self.msg_queue.put(("engine_status", (engine, "ok", detail)))
             else:
-                self.msg_queue.put(("claude_status", "not_logged_in", None))
+                self.msg_queue.put(("engine_status", (engine, "not_logged_in", None)))
 
         threading.Thread(target=work, daemon=True).start()
 
     def _start_login(self):
-        self.login_button.pack_forget()
-        self.claude_status_var.set("Opening Claude Code login (check your browser/terminal)...")
+        engine = self._engine_key()
+        info = preflight.ENGINES[engine]
+        self.login_button.config(state="disabled")
+        self.engine_status_var.set(f"Opening {info['label']} login (check your browser/terminal)...")
 
         def work():
-            status = preflight.claude_login()
+            status = info["login"]()
             if status.get("loggedIn"):
-                self.msg_queue.put(("claude_status", "ok", status.get("email", "")))
+                detail = status.get("email") or status.get("detail") or ""
+                self.msg_queue.put(("engine_status", (engine, "ok", detail)))
             else:
-                self.msg_queue.put(("claude_status", "not_logged_in", None))
+                self.msg_queue.put(("engine_status", (engine, "not_logged_in", None)))
 
         threading.Thread(target=work, daemon=True).start()
+
+    # ---- local AI settings ----
+
+    def _refresh_local_ai_status(self):
+        if self.local_ai_base_url and self.local_ai_model:
+            self._engine_ready = True
+            self.engine_status_var.set(f"Local AI: {self.local_ai_model} @ {self.local_ai_base_url}")
+        else:
+            self._engine_ready = False
+            self.engine_status_var.set("Local AI: not configured -- click ⚙ to set the URL, API key, and model.")
+        self._update_translate_state()
+
+    def _open_local_ai_settings(self):
+        import ttkbootstrap as tb
+
+        dialog = tb.Toplevel(self.root)
+        dialog.title("Local AI settings")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        form = tb.Frame(dialog, padding=16)
+        form.pack(fill="both", expand=True)
+        form.columnconfigure(1, weight=1, minsize=280)
+
+        tb.Label(form, text="Base URL").grid(row=0, column=0, sticky="w", pady=(0, 8), padx=(0, 12))
+        base_url_var = tk.StringVar(value=self.local_ai_base_url)
+        tb.Entry(form, textvariable=base_url_var).grid(row=0, column=1, sticky="ew", pady=(0, 8))
+
+        tb.Label(form, text="API Key").grid(row=1, column=0, sticky="w", pady=(0, 8), padx=(0, 12))
+        api_key_var = tk.StringVar(value=self.local_ai_api_key)
+        tb.Entry(form, textvariable=api_key_var, show="*").grid(row=1, column=1, sticky="ew", pady=(0, 8))
+
+        tb.Label(form, text="Model").grid(row=2, column=0, sticky="w", pady=(0, 8), padx=(0, 12))
+        model_var = tk.StringVar(value=self.local_ai_model)
+        model_combo = tb.Combobox(form, textvariable=model_var, values=[])
+        model_combo.grid(row=2, column=1, sticky="ew", pady=(0, 8))
+
+        test_status_var = tk.StringVar(value="")
+        tb.Label(form, textvariable=test_status_var, bootstyle="secondary",
+                 wraplength=360, justify="left").grid(row=3, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+        button_row = tb.Frame(form)
+        button_row.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+
+        test_button = tb.Button(button_row, text="Test connection", bootstyle="info-outline")
+        test_button.pack(side="left")
+
+        def do_test():
+            base_url = base_url_var.get().strip()
+            api_key = api_key_var.get().strip()
+            if not base_url:
+                test_status_var.set("Enter a base URL first.")
+                return
+            test_button.config(state="disabled")
+            test_status_var.set("Testing...")
+            result_queue = queue.Queue()
+
+            def work():
+                try:
+                    models = local_ai_driver.list_models(base_url, api_key)
+                    result_queue.put(("ok", models))
+                except Exception as exc:
+                    result_queue.put(("error", str(exc)))
+
+            threading.Thread(target=work, daemon=True).start()
+
+            def poll():
+                try:
+                    kind, payload = result_queue.get_nowait()
+                except queue.Empty:
+                    dialog.after(100, poll)
+                    return
+                test_button.config(state="normal")
+                if kind == "ok":
+                    test_status_var.set(f"Connected. {len(payload)} model(s) found.")
+                    model_combo.config(values=payload)
+                    if payload and not model_var.get():
+                        model_var.set(payload[0])
+                else:
+                    test_status_var.set(f"Failed: {payload}")
+
+            dialog.after(100, poll)
+
+        test_button.config(command=do_test)
+
+        def do_save():
+            self.local_ai_base_url = base_url_var.get().strip()
+            self.local_ai_api_key = api_key_var.get().strip()
+            self.local_ai_model = model_var.get().strip()
+            if self._engine_key() == "local_ai":
+                self._refresh_local_ai_status()
+            dialog.destroy()
+
+        tb.Button(button_row, text="Save", bootstyle="primary", command=do_save).pack(side="right")
+        tb.Button(button_row, text="Cancel", bootstyle="secondary",
+                  command=dialog.destroy).pack(side="right", padx=(0, 8))
 
     # ---- chunk list ----
 
@@ -342,7 +564,7 @@ class App:
         self.selected_chunk = None
         self.book = None
         self.chunks_placeholder.pack(padx=8, pady=8, anchor="w")
-        self._render_preview_html("<html><body></body></html>")
+        self._render_preview_empty()
 
     def _populate_chunks(self, raw_chunks, chunk_tokens):
         self.chunks_placeholder.pack_forget()
@@ -357,20 +579,23 @@ class App:
         self.chunks_canvas.itemconfig(self.chunks_window_id, width=self.chunks_canvas.winfo_width())
 
     def _build_chunk_row(self, chunk: "ChunkInfo"):
-        row = ttk.Frame(self.chunks_inner)
-        row.pack(fill="x", padx=4, pady=2)
+        import ttkbootstrap as tb
 
-        info_label = ttk.Label(row, text=f"Chunk {chunk.index} (~{chunk.tokens:,} tok)",
-                                cursor="hand2", anchor="w")
+        row = tb.Frame(self.chunks_inner, padding=(8, 6))
+        row.pack(fill="x", padx=2, pady=1)
+
+        info_label = tb.Label(row, text=f"Chunk {chunk.index}   ·   ~{chunk.tokens:,} tok",
+                               cursor="hand2", anchor="w")
         info_label.pack(side="left", fill="x", expand=True)
         info_label.bind("<Button-1>", lambda e, c=chunk: self._select_chunk(c))
 
-        status_label = ttk.Label(row, text="queued", foreground="#999999", width=8, anchor="w")
-        status_label.pack(side="left")
+        status_label = tb.Label(row, text="queued", bootstyle="secondary-inverse",
+                                 width=13, anchor="center")
+        status_label.pack(side="left", padx=(4, 8))
 
-        retranslate_button = ttk.Button(row, text="Retry", width=6,
-                                         command=lambda c=chunk: self._on_retranslate_chunk(c))
-        retranslate_button.pack(side="left", padx=(4, 0))
+        retranslate_button = tb.Button(row, text="Retry", bootstyle="outline-secondary", width=7,
+                                        command=lambda c=chunk: self._on_retranslate_chunk(c))
+        retranslate_button.pack(side="left")
 
         chunk.row_frame = row
         chunk.info_label = info_label
@@ -378,9 +603,9 @@ class App:
         chunk.retranslate_button = retranslate_button
 
     def _refresh_chunk_row(self, chunk: "ChunkInfo"):
-        text, color = STATUS_LABELS.get(chunk.status, (chunk.status, "#666666"))
+        text, style = STATUS_LABELS.get(chunk.status, (chunk.status, "secondary"))
         if chunk.status_label is not None:
-            chunk.status_label.config(text=text, foreground=color)
+            chunk.status_label.config(text=text, bootstyle=f"{style}-inverse")
         if chunk.retranslate_button is not None:
             busy = chunk.retranslating or self.full_translate_active
             chunk.retranslate_button.config(state="disabled" if busy else "normal")
@@ -400,6 +625,9 @@ class App:
     def _render_chunk_preview(self, chunk: "ChunkInfo"):
         self._render_preview_html(f"<html><body>{chunk.current_html()}</body></html>")
 
+    def _render_preview_empty(self):
+        self._render_preview_html(f'<html><body style="background:{self._preview_bg};"></body></html>')
+
     def _render_preview_html(self, html: str):
         try:
             self.preview_frame.load_html(html)
@@ -415,7 +643,7 @@ class App:
             and self.lang_var.get().strip() != ""
             and not self.full_translate_active
             and not any_chunk_busy
-            and self._claude_ready
+            and self._engine_ready
         )
         self.translate_button.config(state="normal" if ready else "disabled")
 
@@ -425,6 +653,8 @@ class App:
         target_lang = self.lang_var.get().strip()
         if not target_lang:
             return
+        source_lang = self.source_lang_var.get().strip()
+        engine = self._engine_key()
 
         output_name = self.output_name_var.get().strip()
         if not output_name:
@@ -442,6 +672,8 @@ class App:
             return
 
         self.target_lang = target_lang
+        self.source_lang = source_lang
+        self.engine = engine
         self.output_path = output_path
         self.full_translate_active = True
         self.translate_button.config(state="disabled")
@@ -458,9 +690,19 @@ class App:
 
         threading.Thread(
             target=self._parse_and_translate_all,
-            args=(self.source_path, target_lang, output_path),
+            args=(self.source_path, target_lang, source_lang, engine, output_path, self._engine_call_kwargs(engine)),
             daemon=True,
         ).start()
+
+    def _engine_call_kwargs(self, engine: str) -> dict:
+        """Extra keyword args a driver's translate_chunk needs beyond
+        (units, target_lang, model) -- only local_ai needs anything here."""
+        if engine == "local_ai":
+            return {"base_url": self.local_ai_base_url, "api_key": self.local_ai_api_key}
+        return {}
+
+    def _engine_model(self, engine: str):
+        return self.local_ai_model if engine == "local_ai" else None
 
     def _tick_timer(self):
         if not self.full_translate_active or self._start_time is None:
@@ -474,14 +716,15 @@ class App:
         )
         self.root.after(500, self._tick_timer)
 
-    def _parse_and_translate_all(self, source_path, target_lang, output_path):
+    def _parse_and_translate_all(self, source_path, target_lang, source_lang, engine, output_path, engine_kwargs):
         try:
-            import claude_driver
             import epub_io
 
+            driver = DRIVERS[engine]
+            model = self._engine_model(engine)
             book = epub_io.load_book(str(source_path))
-            chunks = claude_driver.pack_chunks(book.units, MAX_TOKENS_PER_CHUNK)
-            chunk_tokens = [sum(claude_driver.estimate_tokens(u.html) for u in chunk) for chunk in chunks]
+            chunks = translation_common.pack_chunks(book.units, MAX_TOKENS_PER_CHUNK)
+            chunk_tokens = [sum(translation_common.estimate_tokens(u.html) for u in chunk) for chunk in chunks]
             total_tokens = sum(chunk_tokens)
             pages = epub_io.estimate_pages(book.units)
 
@@ -494,7 +737,9 @@ class App:
 
             def run_one(index, chunk, tokens):
                 self.msg_queue.put(("chunk_started", index))
-                translations, error = claude_driver.translate_chunk(chunk, target_lang, None)
+                translations, error = driver.translate_chunk(
+                    chunk, target_lang, model, source_lang=source_lang, **engine_kwargs
+                )
                 return index, translations, error
 
             error_count = 0
@@ -535,22 +780,30 @@ class App:
     def _on_retranslate_chunk(self, chunk: "ChunkInfo"):
         if chunk.retranslating or self.full_translate_active:
             return
-        if not self._claude_ready:
-            messagebox.showerror("Claude Code not ready", "Claude Code isn't installed or logged in yet.")
+        engine = self._engine_key()
+        if not self._engine_ready:
+            reason = ("isn't configured yet -- click ⚙ to set it up." if engine == "local_ai"
+                      else "isn't installed or logged in yet.")
+            messagebox.showerror(f"{ENGINE_LABELS[engine]} not ready", f"{ENGINE_LABELS[engine]} {reason}")
             return
         target_lang = self.lang_var.get().strip() or self.target_lang
         if not target_lang:
             messagebox.showerror("No language", "Pick a target language first.")
             return
+        source_lang = self.source_lang_var.get().strip() or self.source_lang
 
         chunk.retranslating = True
         chunk.status = "translating"
         self._refresh_chunk_row(chunk)
         self._update_translate_state()
+        model = self._engine_model(engine)
+        engine_kwargs = self._engine_call_kwargs(engine)
 
         def work():
-            import claude_driver
-            translations, error = claude_driver.translate_chunk(chunk.units, target_lang, None)
+            driver = DRIVERS[engine]
+            translations, error = driver.translate_chunk(
+                chunk.units, target_lang, model, source_lang=source_lang, **engine_kwargs
+            )
             self.msg_queue.put(("chunk_result", (chunk.index, translations, error)))
 
         threading.Thread(target=work, daemon=True).start()
@@ -658,28 +911,33 @@ class App:
             self._update_translate_state()
             self.status_var.set("Failed.")
             messagebox.showerror("Translation failed", payload[0])
-        elif kind == "claude_status":
-            status, email = payload[0], payload[1]
+        elif kind == "engine_status":
+            engine, status, detail = payload[0]
+            if engine != self._engine_key():
+                return  # a stale check for an engine that's no longer selected -- ignore it
+            label = ENGINE_LABELS[engine]
             if status == "ok":
-                self._claude_ready = True
-                self.claude_status_var.set(f"Claude Code: logged in as {email}" if email else "Claude Code: logged in")
-                self.login_button.pack_forget()
+                self._engine_ready = True
+                self.engine_status_var.set(f"✓ {label}: logged in as {detail}" if detail else f"✓ {label}: logged in")
+                self.login_button.config(text=f"Log in to {label}", state="disabled", bootstyle="secondary-outline")
             elif status == "not_logged_in":
-                self._claude_ready = False
-                self.claude_status_var.set("Claude Code: not logged in")
-                self.login_button.pack(after=self.claude_status_label, pady=(0, 8))
+                self._engine_ready = False
+                self.engine_status_var.set(f"{label}: not logged in")
+                self.login_button.config(text=f"Log in to {label}", state="normal", bootstyle="warning")
             elif status == "not_installed":
-                self._claude_ready = False
-                self.claude_status_var.set(preflight.CLAUDE_INSTALL_HINT)
-                self.login_button.pack_forget()
+                self._engine_ready = False
+                self.engine_status_var.set(preflight.ENGINES[engine]["cli_hint"])
+                self.login_button.config(text=f"Log in to {label}", state="disabled", bootstyle="secondary-outline")
             self._update_translate_state()
 
 
 def main():
     _ensure_gui_deps()
     from tkinterdnd2 import TkinterDnD
+    import ttkbootstrap as tb
 
     root = TkinterDnD.Tk()
+    tb.Style(theme=THEME)
     App(root)
     root.mainloop()
 

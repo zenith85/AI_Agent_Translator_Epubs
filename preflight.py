@@ -18,6 +18,12 @@ CLAUDE_INSTALL_HINT = (
     f"See {CLAUDE_INSTALL_URL} for the current installer for your OS."
 )
 
+CODEX_INSTALL_HINT = (
+    "Codex isn't installed (the `codex` command isn't on your PATH).\n"
+    "Commonly installed with:\n"
+    "    npm install -g @openai/codex"
+)
+
 EPUB_DEPS = [("bs4", "beautifulsoup4"), ("lxml", "lxml"), ("ebooklib", "EbookLib")]
 
 
@@ -38,6 +44,54 @@ def claude_login() -> dict:
     visible in the terminal that launched us) and returns the refreshed status."""
     subprocess.run(["claude", "auth", "login"])
     return claude_auth_status()
+
+
+def is_codex_installed() -> bool:
+    return shutil.which("codex") is not None
+
+
+def codex_login_status() -> dict:
+    """Codex's CLI has no --json for login status, so this parses its plain-text
+    output (e.g. "Logged in using ChatGPT"). Normalized to the same {"loggedIn",
+    "email"} shape as claude_auth_status() so callers can treat both uniformly --
+    Codex just never has an email, only a "detail" describing the auth method."""
+    try:
+        proc = subprocess.run(["codex", "login", "status"], capture_output=True, text=True, timeout=30)
+    except (subprocess.TimeoutExpired, OSError):
+        return {}
+    # Codex prints its status line to stderr, not stdout -- check both.
+    output = ((proc.stdout or "") + (proc.stderr or "")).strip()
+    if "logged in" in output.lower():
+        detail = output.split(" using ", 1)[-1].strip() if " using " in output.lower() else output
+        return {"loggedIn": True, "email": "", "detail": detail}
+    return {"loggedIn": False, "email": "", "detail": output}
+
+
+def codex_login() -> dict:
+    """Runs `codex login` inheriting stdio and returns the refreshed status."""
+    subprocess.run(["codex", "login"])
+    return codex_login_status()
+
+
+# Lets callers (gui.py, translate_epub.py) treat either engine uniformly instead
+# of hardcoding if/elif branches per engine -- add a new engine here later by
+# adding one more entry, not by editing every call site.
+ENGINES = {
+    "claude": {
+        "label": "Claude",
+        "cli_hint": CLAUDE_INSTALL_HINT,
+        "is_installed": is_claude_installed,
+        "auth_status": claude_auth_status,
+        "login": claude_login,
+    },
+    "codex": {
+        "label": "Codex",
+        "cli_hint": CODEX_INSTALL_HINT,
+        "is_installed": is_codex_installed,
+        "auth_status": codex_login_status,
+        "login": codex_login,
+    },
+}
 
 
 def missing_modules(modules: list) -> list:

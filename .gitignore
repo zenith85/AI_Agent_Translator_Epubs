@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 *.epub
 gui_launch.log
+Extra/

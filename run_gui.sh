@@ -1,5 +1,5 @@
 #!/bin/bash
-# Double-clickable (or `./run_gui.sh`) launcher for the EPUB Translator GUI on Linux/macOS.
+# Double-clickable (or `./run_gui.sh`) launcher for the INNO AI Agent Translator GUI on Linux/macOS.
 set -o pipefail
 cd "$(dirname "$(readlink -f "$0")")" || exit 1
 
