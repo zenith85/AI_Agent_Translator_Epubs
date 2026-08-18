@@ -3,12 +3,16 @@
 
 Bootstraps its own dependencies (tkinterdnd2 for drag-and-drop, tkinterweb for
 the rendered preview, plus the epub parsing libraries) the same way
-translate_epub.py does, then shows a window: drop or browse for an .epub,
-pick an engine and a language, click Translate. Once translated, every chunk
-shows up in a list on the left with its own Re-translate button (which uses
-whichever engine is currently selected, so a chunk can be retried with the
-other engine); clicking a chunk renders its current (translated) HTML in a
-preview pane on the right.
+translate_epub.py does, then shows a window: drop or browse for an .epub, pick
+an engine and a language, click Load Book. That only parses and chunks the
+book -- nothing is translated automatically. Each chunk in the list on the
+left gets its own Start button (Retry once it's been attempted) and a Cancel
+button that's enabled while it's running and actually kills the in-flight
+`claude`/`codex` subprocess; translating whichever chunks you want, in
+whatever order, with whichever engine is currently selected, is entirely up
+to you. Clicking a chunk renders its current (translated or original) HTML in
+a preview pane on the right. The output epub is rewritten after every chunk
+that finishes, so it's always in sync with what's been translated so far.
 
 Threading model: worker threads only ever call claude_driver/codex_driver
 (network-bound, side-effect-free) and hand results back over a queue. All
@@ -22,9 +26,7 @@ import queue
 import re
 import sys
 import threading
-import time
 import tkinter as tk
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -52,18 +54,18 @@ ENGINE_LABELS = {**{key: preflight.ENGINES[key]["label"] for key in ("claude", "
 ENGINE_KEYS_BY_LABEL = {label: key for key, label in ENGINE_LABELS.items()}
 
 COMMON_LANGUAGES = [
-    "Spanish", "French", "German", "Italian", "Portuguese (Brazil)",
+    "English", "Spanish", "French", "German", "Italian", "Portuguese (Brazil)",
     "Japanese", "Korean", "Simplified Chinese", "Arabic", "Russian", "Hindi",
 ]
 
-MAX_TOKENS_PER_CHUNK = 6000
-CONCURRENCY = 3
+MAX_TOKENS_PER_CHUNK = 3000
 
 STATUS_LABELS = {
     "queued": ("queued", "secondary"),
     "translating": ("translating…", "warning"),
     "done": ("done", "success"),
     "failed": ("failed", "danger"),
+    "cancelled": ("cancelled", "secondary"),
 }
 
 
@@ -117,13 +119,15 @@ class ChunkInfo:
         self.index = index
         self.units = units
         self.tokens = tokens
-        self.status = "queued"  # queued | translating | done | failed
+        self.status = "queued"  # queued | translating | done | failed | cancelled
         self.error = None
-        self.retranslating = False
+        self.cancel_event = None
         self.row_frame = None
         self.info_label = None
         self.status_label = None
-        self.retranslate_button = None
+        self.start_button = None
+        self.cancel_button = None
+        self.progress_bar = None
 
     def current_html(self) -> str:
         return "\n".join(str(u.tag) for u in self.units)
@@ -138,7 +142,7 @@ class App:
 
         self.source_path = None
         self.msg_queue = queue.Queue()
-        self.full_translate_active = False
+        self._loading = False  # parsing/chunking the book -- not translation, which is per-chunk now
         self._engine_ready = False
         self._checked_engine = None  # which engine the last status check was for
 
@@ -155,12 +159,6 @@ class App:
         self.target_lang = ""
         self.source_lang = ""
         self._write_lock = threading.Lock()
-
-        self._start_time = None
-        self._total_tokens = 0
-        self._completed_tokens = 0
-        self._total_chunks = 0
-        self._completed_chunks = 0
 
         self._build_ui()
         self._poll_queue()
@@ -263,8 +261,8 @@ class App:
         except Exception:
             pass  # drag-and-drop unavailable; clicking to browse still works
 
-        self.translate_button = tb.Button(sidebar, text="Translate", bootstyle="primary",
-                                           command=self._on_translate, state="disabled")
+        self.translate_button = tb.Button(sidebar, text="Load Book", bootstyle="primary",
+                                           command=self._on_load_book, state="disabled")
         self.translate_button.pack(fill="x", pady=(6, 10))
 
         self.progress = tb.Progressbar(sidebar, mode="determinate", bootstyle="primary")
@@ -355,15 +353,18 @@ class App:
 
     # ---- file selection ----
 
+    def _any_chunk_busy(self) -> bool:
+        return any(c.status == "translating" for c in self.chunks)
+
     def _browse(self):
-        if self.full_translate_active:
+        if self._loading or self._any_chunk_busy():
             return
         path = filedialog.askopenfilename(title="Choose an EPUB", filetypes=[("EPUB files", "*.epub")])
         if path:
             self._set_file(Path(path))
 
     def _on_drop(self, event):
-        if self.full_translate_active:
+        if self._loading or self._any_chunk_busy():
             return
         paths = _parse_dnd_paths(event.data)
         epub_paths = [p for p in paths if p.lower().endswith(".epub")]
@@ -584,35 +585,57 @@ class App:
         row = tb.Frame(self.chunks_inner, padding=(8, 6))
         row.pack(fill="x", padx=2, pady=1)
 
-        info_label = tb.Label(row, text=f"Chunk {chunk.index}   ·   ~{chunk.tokens:,} tok",
+        # header is its own full-width frame (rather than packing the label/status/button
+        # straight into row) so the progress bar below has a "cavity" to fill the whole
+        # row's width -- packing side="left" widgets leaves only a slim strip next to them.
+        header = tb.Frame(row)
+        header.pack(fill="x")
+
+        info_label = tb.Label(header, text=f"Chunk {chunk.index}   ·   ~{chunk.tokens:,} tok",
                                cursor="hand2", anchor="w")
         info_label.pack(side="left", fill="x", expand=True)
         info_label.bind("<Button-1>", lambda e, c=chunk: self._select_chunk(c))
 
-        status_label = tb.Label(row, text="queued", bootstyle="secondary-inverse",
+        status_label = tb.Label(header, text="queued", bootstyle="secondary-inverse",
                                  width=13, anchor="center")
         status_label.pack(side="left", padx=(4, 8))
 
-        retranslate_button = tb.Button(row, text="Retry", bootstyle="outline-secondary", width=7,
-                                        command=lambda c=chunk: self._on_retranslate_chunk(c))
-        retranslate_button.pack(side="left")
+        start_button = tb.Button(header, text="Start", bootstyle="outline-primary", width=7,
+                                  command=lambda c=chunk: self._on_start_chunk(c))
+        start_button.pack(side="left", padx=(4, 0))
+
+        cancel_button = tb.Button(header, text="Cancel", bootstyle="outline-danger", width=7,
+                                   command=lambda c=chunk: self._on_cancel_chunk(c), state="disabled")
+        cancel_button.pack(side="left", padx=(4, 0))
+
+        progress_bar = tb.Progressbar(row, mode="indeterminate", bootstyle="warning-striped")
 
         chunk.row_frame = row
         chunk.info_label = info_label
         chunk.status_label = status_label
-        chunk.retranslate_button = retranslate_button
+        chunk.start_button = start_button
+        chunk.cancel_button = cancel_button
+        chunk.progress_bar = progress_bar
 
     def _refresh_chunk_row(self, chunk: "ChunkInfo"):
         text, style = STATUS_LABELS.get(chunk.status, (chunk.status, "secondary"))
+        translating = chunk.status == "translating"
         if chunk.status_label is not None:
             chunk.status_label.config(text=text, bootstyle=f"{style}-inverse")
-        if chunk.retranslate_button is not None:
-            busy = chunk.retranslating or self.full_translate_active
-            chunk.retranslate_button.config(state="disabled" if busy else "normal")
-
-    def _refresh_all_chunk_rows(self):
-        for chunk in self.chunks:
-            self._refresh_chunk_row(chunk)
+        if chunk.start_button is not None:
+            label = "Start" if chunk.status == "queued" else "Retry"
+            busy = translating or self._loading
+            chunk.start_button.config(text=label, state="disabled" if busy else "normal")
+        if chunk.cancel_button is not None:
+            chunk.cancel_button.config(state="normal" if translating else "disabled")
+        if chunk.progress_bar is not None:
+            if translating:
+                if not chunk.progress_bar.winfo_ismapped():
+                    chunk.progress_bar.pack(fill="x", pady=(4, 0))
+                    chunk.progress_bar.start(12)
+            elif chunk.progress_bar.winfo_ismapped():
+                chunk.progress_bar.stop()
+                chunk.progress_bar.pack_forget()
 
     def _select_chunk(self, chunk: "ChunkInfo"):
         if self.selected_chunk is not None and self.selected_chunk.info_label is not None:
@@ -634,27 +657,25 @@ class App:
         except Exception:
             pass
 
-    # ---- translate (whole book) ----
+    # ---- load book (parse + chunk only -- translating each chunk is manual, see below) ----
 
     def _update_translate_state(self):
-        any_chunk_busy = any(c.retranslating for c in self.chunks)
         ready = (
             self.source_path is not None
             and self.lang_var.get().strip() != ""
-            and not self.full_translate_active
-            and not any_chunk_busy
+            and not self._loading
+            and not self._any_chunk_busy()
             and self._engine_ready
         )
         self.translate_button.config(state="normal" if ready else "disabled")
 
-    def _on_translate(self):
-        if self.full_translate_active or self.source_path is None:
+    def _on_load_book(self):
+        if self._loading or self._any_chunk_busy() or self.source_path is None:
             return
         target_lang = self.lang_var.get().strip()
         if not target_lang:
             return
         source_lang = self.source_lang_var.get().strip()
-        engine = self._engine_key()
 
         output_name = self.output_name_var.get().strip()
         if not output_name:
@@ -673,26 +694,14 @@ class App:
 
         self.target_lang = target_lang
         self.source_lang = source_lang
-        self.engine = engine
         self.output_path = output_path
-        self.full_translate_active = True
+        self._loading = True
         self.translate_button.config(state="disabled")
         self.progress.config(value=0, maximum=1)
         self.status_var.set(f"Parsing {self.source_path.name}...")
         self._clear_chunks()
 
-        self._start_time = time.time()
-        self._total_tokens = 0
-        self._completed_tokens = 0
-        self._total_chunks = 0
-        self._completed_chunks = 0
-        self._tick_timer()
-
-        threading.Thread(
-            target=self._parse_and_translate_all,
-            args=(self.source_path, target_lang, source_lang, engine, output_path, self._engine_call_kwargs(engine)),
-            daemon=True,
-        ).start()
+        threading.Thread(target=self._parse_and_load, args=(self.source_path,), daemon=True).start()
 
     def _engine_call_kwargs(self, engine: str) -> dict:
         """Extra keyword args a driver's translate_chunk needs beyond
@@ -704,24 +713,20 @@ class App:
     def _engine_model(self, engine: str):
         return self.local_ai_model if engine == "local_ai" else None
 
-    def _tick_timer(self):
-        if not self.full_translate_active or self._start_time is None:
-            return
-        elapsed = int(time.time() - self._start_time)
-        mins, secs = divmod(elapsed, 60)
-        self.status_var.set(
-            f"Chunk {self._completed_chunks}/{self._total_chunks} done · "
-            f"{self._completed_tokens:,}/{self._total_tokens:,} tokens · "
-            f"elapsed {mins}:{secs:02d}"
-        )
-        self.root.after(500, self._tick_timer)
+    def _update_overall_progress(self):
+        total = len(self.chunks)
+        finished = sum(1 for c in self.chunks if c.status in ("done", "failed", "cancelled"))
+        self.progress.config(value=finished, maximum=max(1, total))
+        if total and finished:
+            self.status_var.set(f"{finished}/{total} chunk(s) finished.")
 
-    def _parse_and_translate_all(self, source_path, target_lang, source_lang, engine, output_path, engine_kwargs):
+    def _parse_and_load(self, source_path):
+        """Parse the epub and pack it into chunks -- nothing is translated here.
+        Each chunk shows up in the list with a Start button; translating it is
+        entirely up to the user clicking that button (or Retry, once attempted)."""
         try:
             import epub_io
 
-            driver = DRIVERS[engine]
-            model = self._engine_model(engine)
             book = epub_io.load_book(str(source_path))
             chunks = translation_common.pack_chunks(book.units, MAX_TOKENS_PER_CHUNK)
             chunk_tokens = [sum(translation_common.estimate_tokens(u.html) for u in chunk) for chunk in chunks]
@@ -731,54 +736,16 @@ class App:
             self.msg_queue.put(("book_ready", (book, chunks, chunk_tokens)))
             self.msg_queue.put(("status_line", (
                 f"{len(book.chapters)} chapter(s), ~{pages} page(s), {len(book.units)} unit(s), "
-                f"~{total_tokens:,} estimated tokens, packed into {len(chunks)} chunk(s)."
+                f"~{total_tokens:,} estimated tokens, packed into {len(chunks)} chunk(s). "
+                "Click Start on a chunk to translate it."
             )))
-            self.msg_queue.put(("meta", (len(chunks), total_tokens)))
-
-            def run_one(index, chunk, tokens):
-                self.msg_queue.put(("chunk_started", index))
-                translations, error = driver.translate_chunk(
-                    chunk, target_lang, model, source_lang=source_lang, **engine_kwargs
-                )
-                return index, translations, error
-
-            error_count = 0
-            if chunks:
-                with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
-                    futures = [
-                        pool.submit(run_one, i, chunk, chunk_tokens[i - 1])
-                        for i, chunk in enumerate(chunks, start=1)
-                    ]
-                    completed = 0
-                    completed_tokens = 0
-                    for future in as_completed(futures):
-                        index, translations, error = future.result()
-                        completed += 1
-                        completed_tokens += chunk_tokens[index - 1]
-                        if error is not None:
-                            error_count += 1
-                        self.msg_queue.put(("chunk_result", (index, translations, error)))
-                        self.msg_queue.put(("progress", (completed, completed_tokens)))
-
-            self.msg_queue.put(("write_and_finish", (len(chunks), error_count)))
         except Exception as exc:
             self.msg_queue.put(("error", str(exc)))
 
-    def _finish_full_translate(self, total_chunks, error_count):
-        source_path, output_path, book = self.source_path, self.output_path, self.book
+    # ---- per-chunk translate (Start / Retry / Cancel) ----
 
-        def write():
-            import epub_io
-            with self._write_lock:
-                epub_io.write_translated_epub(str(source_path), book.chapters, str(output_path))
-            self.msg_queue.put(("full_translate_done", (str(output_path), error_count, total_chunks)))
-
-        threading.Thread(target=write, daemon=True).start()
-
-    # ---- per-chunk re-translate ----
-
-    def _on_retranslate_chunk(self, chunk: "ChunkInfo"):
-        if chunk.retranslating or self.full_translate_active:
+    def _on_start_chunk(self, chunk: "ChunkInfo"):
+        if chunk.status == "translating" or self._loading:
             return
         engine = self._engine_key()
         if not self._engine_ready:
@@ -792,8 +759,9 @@ class App:
             return
         source_lang = self.source_lang_var.get().strip() or self.source_lang
 
-        chunk.retranslating = True
         chunk.status = "translating"
+        chunk.cancel_event = threading.Event()
+        cancel_event = chunk.cancel_event
         self._refresh_chunk_row(chunk)
         self._update_translate_state()
         model = self._engine_model(engine)
@@ -802,11 +770,18 @@ class App:
         def work():
             driver = DRIVERS[engine]
             translations, error = driver.translate_chunk(
-                chunk.units, target_lang, model, source_lang=source_lang, **engine_kwargs
+                chunk.units, target_lang, model, source_lang=source_lang,
+                cancel_event=cancel_event, **engine_kwargs
             )
             self.msg_queue.put(("chunk_result", (chunk.index, translations, error)))
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _on_cancel_chunk(self, chunk: "ChunkInfo"):
+        if chunk.status != "translating" or chunk.cancel_event is None:
+            return
+        chunk.cancel_event.set()
+        chunk.cancel_button.config(state="disabled")  # avoid double-clicks while the worker winds down
 
     def _apply_chunk_result(self, index, translations, error) -> "ChunkInfo":
         chunk = self.chunks[index - 1]
@@ -815,13 +790,22 @@ class App:
             epub_io.apply_translations(chunk.units, translations)
         except Exception as exc:
             error = error or exc
-        chunk.status = "failed" if error else "done"
+        cancelled = isinstance(error, translation_common.TranslationCancelled)
+        chunk.status = "cancelled" if cancelled else ("failed" if error else "done")
         chunk.error = error
-        chunk.retranslating = False
+        chunk.cancel_event = None
         self._refresh_chunk_row(chunk)
         if self.selected_chunk is chunk:
             self._render_chunk_preview(chunk)
         self._update_translate_state()
+        self._update_overall_progress()
+        if error is not None and not cancelled:
+            messagebox.showwarning(
+                "Translate",
+                f"Chunk {chunk.index} still has errors (some text may have fallen back "
+                f"to the original): {chunk.error}",
+            )
+        self._schedule_write()
         return chunk
 
     def _schedule_write(self):
@@ -861,56 +845,19 @@ class App:
             book, raw_chunks, chunk_tokens = payload[0]
             self.book = book
             self._populate_chunks(raw_chunks, chunk_tokens)
-        elif kind == "meta":
-            self._total_chunks, self._total_tokens = payload[0]
-            self.progress.config(maximum=max(1, self._total_chunks))
-        elif kind == "chunk_started":
-            index = payload[0]
-            chunk = self.chunks[index - 1]
-            chunk.status = "translating"
-            self._refresh_chunk_row(chunk)
-        elif kind == "progress":
-            self._completed_chunks, self._completed_tokens = payload[0]
-            self.progress.config(value=self._completed_chunks)
+            self._loading = False
+            self._update_translate_state()
+            self._update_overall_progress()
         elif kind == "chunk_result":
             index, translations, error = payload[0]
-            chunk = self._apply_chunk_result(index, translations, error)
-            if not self.full_translate_active:
-                # standalone re-translate -- save immediately, per how this chunk view is meant to work
-                if error is not None:
-                    messagebox.showwarning(
-                        "Re-translate",
-                        f"Chunk {chunk.index} still couldn't be translated correctly: {chunk.error}",
-                    )
-                self._schedule_write()
-        elif kind == "write_and_finish":
-            total_chunks, error_count = payload[0]
-            self._finish_full_translate(total_chunks, error_count)
+            self._apply_chunk_result(index, translations, error)
         elif kind == "write_complete":
             pass
-        elif kind == "full_translate_done":
-            output_path, error_count, total_chunks = payload[0]
-            self.full_translate_active = False
-            self._refresh_all_chunk_rows()
-            self._update_translate_state()
-            elapsed = int(time.time() - self._start_time) if self._start_time else 0
-            mins, secs = divmod(elapsed, 60)
-            self.status_var.set(f"Done in {mins}:{secs:02d} · {self._total_tokens:,} tokens")
-            if error_count:
-                messagebox.showinfo(
-                    "Translation complete",
-                    f"Saved to:\n{output_path}\n\n"
-                    f"{error_count}/{total_chunks} chunk(s) kept original text after repeated errors "
-                    "-- select them on the left and click Re-translate to try again.",
-                )
-            else:
-                messagebox.showinfo("Translation complete", f"Saved to:\n{output_path}")
         elif kind == "error":
-            self.full_translate_active = False
-            self._refresh_all_chunk_rows()
+            self._loading = False
             self._update_translate_state()
-            self.status_var.set("Failed.")
-            messagebox.showerror("Translation failed", payload[0])
+            self.status_var.set("Failed to load the book.")
+            messagebox.showerror("Load failed", payload[0])
         elif kind == "engine_status":
             engine, status, detail = payload[0]
             if engine != self._engine_key():

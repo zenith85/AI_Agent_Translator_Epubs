@@ -7,8 +7,8 @@ CLI you pick (`claude -p` or `codex exec`) as a one-shot, tool-less call, so it 
 whichever engine's existing login you already have instead of a separate API integration.
 
 Two ways to run it: a drag-and-drop desktop window (`gui.py`), or a menu-driven command
-line (`translate_epub.py`). Both let you pick the engine per run (and even per chunk, in
-the GUI's re-translate button) and share the same parsing/translation code
+line (`translate_epub.py`). Both let you pick the engine per run (and, in the GUI, even per
+chunk via its per-chunk Start/Retry button) and share the same parsing/translation code
 (`epub_io.py`, `claude_driver.py`, `codex_driver.py`, `translation_common.py`, `preflight.py`).
 
 ## How it works
@@ -21,7 +21,7 @@ the GUI's re-translate button) and share the same parsing/translation code
   `<script>/<style>/<pre>/<code>`. Each unit keeps its inline markup (`<em>`, `<a href>`, ...).
 - **Chunking**: all units across the whole book are flattened into one ordered list and
   greedily packed into chunks up to a configurable token budget (`--max-tokens-per-chunk`,
-  default 6000) — chunks aren't forced to align with chapter boundaries.
+  default 3000) — chunks aren't forced to align with chapter boundaries.
 - **Engine choice**: pick Claude or Codex per run (and per chunk, via the GUI's
   re-translate button — handy for comparing how each engine handles a tricky passage).
   `claude_driver.py` calls `claude -p --allowedTools "" --system-prompt "..." --output-format
@@ -35,10 +35,14 @@ the GUI's re-translate button) and share the same parsing/translation code
   with nothing but a JSON array of translated fragments in the same order. The reply is
   validated for length *and* checked that it's actually written in the target script (this
   caught a real bug: one chunk of a Korean-targeted book once came back entirely in
-  Japanese) — either kind of mismatch retries up to twice, and if it still fails that
-  chunk's original text is kept so one bad chunk never fails the whole job. Chunks run
-  concurrently (`--concurrency`, default 3) since each call is an independent, stateless
-  subprocess.
+  Japanese) — either kind of mismatch retries up to twice (also covers a call timing out,
+  each call gets 300s). If a chunk still fails after those retries and it has more than one
+  unit, it's automatically bisected and each half is retried independently with its own
+  retry budget — this is what recovers a chunk that was simply too big for the model to
+  finish translating in time, rather than re-sending the same oversized chunk until it
+  gives up. Only a single unit that still fails on its own falls back to its original
+  (untranslated) HTML. Chunks run concurrently (`--concurrency`, default 3) since each call
+  is an independent, stateless subprocess.
 - **Writing**: the output epub is the original zip copied entry-by-entry, with only the
   translated chapter documents' (and `toc.ncx`'s navigation labels, which many readers use
   for their chapter list and which aren't part of the spine) bytes replaced — everything
@@ -108,12 +112,18 @@ Pick an engine (Claude or Codex) from the dropdown — a status line shows wheth
 ready, with a login button if not. Drag an `.epub` onto the window (or click the drop zone
 to browse) and it immediately shows chapter/page counts; pick a language (type your own if
 it's not in the list); the "Save as" field is pre-filled with a suggested name but freely
-editable. Click Translate: a progress bar and a live "chunk X/Y done · tokens · elapsed"
-line track the run, and every chunk appears in a list on the left as it's queued,
-translated, and finishes. Click any chunk to render its current translated HTML in the
-preview pane on the right; click a chunk's **Retry** button to re-translate just that one
-chunk with whichever engine is currently selected (switch engines first to compare how
-each one handles a specific passage) — the output file is rewritten immediately after.
+editable. Click **Load Book**: this only parses and packs the book into chunks — nothing is
+translated automatically. Every chunk shows up in a list on the left with its own
+**Start** button; click it to translate just that chunk with whichever engine is currently
+selected (switch engines first to compare how each one handles a specific passage). While a
+chunk is running, an animated progress bar and a live "translating… Ns" counter appear under
+its row, and its **Cancel** button becomes active — clicking it actually kills the
+in-flight `claude`/`codex` subprocess (best-effort for Local AI, since a plain HTTP call
+can't be interrupted mid-flight the same way) rather than just hiding the result. Once
+attempted, the button relabels to **Retry**. Click any chunk to render its current
+(translated or original) HTML in the preview pane on the right — the output file is
+rewritten immediately after every chunk that finishes, so it's always in sync with
+whatever's been translated so far.
 
 ## Run — command line
 
@@ -172,7 +182,7 @@ pass all three and it runs with no prompts at all. Other options:
 - `--to <language>` — any free-text target language (omit to be asked).
 - `--engine {claude,codex}` — which CLI to translate with (omit to be asked).
 - `-o/--output <path>` — explicit output path.
-- `--max-tokens-per-chunk <n>` (default 6000) — larger chunks mean fewer, slower calls with
+- `--max-tokens-per-chunk <n>` (default 3000) — larger chunks mean fewer, slower calls with
   more content at risk if one fails; smaller chunks mean more calls but finer-grained
   progress and fallback.
 - `--model <alias-or-name>` — passed through to the engine's CLI (e.g. `sonnet`, `opus`,
@@ -214,9 +224,13 @@ pass all three and it runs with no prompts at all. Other options:
   on Debian/Ubuntu) — that one can't be auto-installed via pip, since it's not a PyPI
   package. Confirmed working on Linux with tkinter 8.6 + tkinterdnd2; drag-and-drop itself
   is unverified on macOS/Windows (clicking to browse for a file always works regardless).
-- The GUI has no cancel/retry button mid-run and doesn't limit concurrency beyond a fixed
-  default of 3 — for very large books, the CLI's `--concurrency`/`--max-tokens-per-chunk`
-  flags give more control.
+- The GUI doesn't cap how many chunks you can have translating at once -- clicking Start on
+  many rows in a row launches that many concurrent subprocesses/requests, since nothing
+  starts unless you click it. For very large books, the CLI's `--concurrency` flag caps
+  this automatically; the GUI expects you to pace yourself.
+- Local AI's Cancel button is best-effort: it stops a chunk from retrying/splitting further
+  and skips a call that hasn't gone out yet, but can't interrupt a chat-completions request
+  that's already in flight (unlike Claude/Codex, where Cancel kills the subprocess directly).
 - `EPUB-Translator.desktop`'s `Exec`/`Path` are hardcoded to this install's absolute path
   (`/home/ibraheem/AI_Par_Ser_Trans`). If you move or copy the project folder, edit those
   two lines in the `.desktop` file to match the new location. `run_gui.sh` and

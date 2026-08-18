@@ -11,22 +11,24 @@ rather than being auto-detected.
 from __future__ import annotations
 
 import json
-import time
 import urllib.error
 import urllib.request
 
-from translation_common import (
-    MAX_RETRIES,
-    TranslationError,
-    strip_code_fence,
-    system_prompt,
-    wrong_script_detected,
-)
+from translation_common import TranslationCancelled, TranslationError, translate_chunk_generic
 
-CALL_TIMEOUT_SECONDS = 180
+CALL_TIMEOUT_SECONDS = 300
 
 
-def _call_local_ai(system: str, user_prompt: str, model: str, base_url: str, api_key: str) -> str:
+def _call_local_ai(system: str, user_prompt: str, model: str, base_url: str, api_key: str,
+                    cancel_event=None) -> str:
+    # Unlike the subprocess-based drivers, a blocking urlopen() can't be polled or
+    # killed mid-flight from another thread -- this only catches a cancel that
+    # happened before the request went out (e.g. while queued behind a retry
+    # backoff). Once the HTTP call is actually in flight, Cancel won't interrupt it;
+    # it'll still stop the chunk from retrying/splitting further once this call returns.
+    if cancel_event is not None and cancel_event.is_set():
+        raise TranslationCancelled("cancelled by user")
+
     url = base_url.rstrip("/") + "/chat/completions"
     payload = {
         "model": model,
@@ -88,38 +90,18 @@ def list_models(base_url: str, api_key: str, timeout: int = 15) -> list:
 
 
 def translate_chunk(units: list, target_lang: str, model: str = None, base_url: str = None,
-                     api_key: str = None, source_lang: str = None):
+                     api_key: str = None, source_lang: str = None, cancel_event=None):
     """Same contract as claude_driver.translate_chunk / codex_driver.translate_chunk:
     returns (translations, error). Unlike those two, model and base_url are
-    required here -- a local server has no sensible default for either."""
+    required here -- a local server has no sensible default for either.
+    See translate_chunk_generic for the retry/auto-split/cancel behavior (and
+    _call_local_ai's docstring for this engine's cancel caveat)."""
     if not base_url:
         return [u.html for u in units], TranslationError("no local AI base URL configured")
     if not model:
         return [u.html for u in units], TranslationError("no local AI model name configured")
 
-    system = system_prompt(target_lang, source_lang)
-    user_prompt = json.dumps([u.html for u in units], ensure_ascii=False)
+    def call_fn(system, user_prompt):
+        return _call_local_ai(system, user_prompt, model, base_url, api_key, cancel_event=cancel_event)
 
-    last_error = None
-    for attempt in range(MAX_RETRIES + 1):
-        try:
-            result_text = _call_local_ai(system, user_prompt, model, base_url, api_key)
-            translations = json.loads(strip_code_fence(result_text))
-            if isinstance(translations, list) and len(translations) == len(units):
-                if wrong_script_detected(translations, target_lang):
-                    last_error = TranslationError(
-                        f"response doesn't look like it's actually in {target_lang} "
-                        "(wrong script detected) -- retrying"
-                    )
-                else:
-                    return translations, None
-            else:
-                got = len(translations) if isinstance(translations, list) else type(translations).__name__
-                last_error = TranslationError(f"expected {len(units)} translations, got {got}")
-        except Exception as exc:  # network/JSON/TranslationError, etc.
-            last_error = exc
-
-        if attempt < MAX_RETRIES:
-            time.sleep(2.0 * (attempt + 1))
-
-    return [u.html for u in units], last_error
+    return translate_chunk_generic(call_fn, units, target_lang, source_lang, cancel_event=cancel_event)

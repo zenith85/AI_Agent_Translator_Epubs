@@ -18,19 +18,22 @@ import subprocess
 import time
 
 from translation_common import (
-    MAX_RETRIES,
+    TranslationCancelled,
     TranslationError,
     estimate_tokens,  # noqa: F401 -- re-exported for callers that only import claude_driver
     pack_chunks,  # noqa: F401
-    strip_code_fence,
-    system_prompt,
-    wrong_script_detected,
+    translate_chunk_generic,
 )
 
-CALL_TIMEOUT_SECONDS = 180
+CALL_TIMEOUT_SECONDS = 300
+
+# How often the poll loop below wakes up to check for cancellation/timeout while
+# `claude -p` is still running. Small enough that Cancel feels immediate, large
+# enough not to busy-loop.
+_POLL_INTERVAL = 0.2
 
 
-def _call_claude(system: str, user_prompt: str, model: str = None) -> str:
+def _call_claude(system: str, user_prompt: str, model: str = None, cancel_event=None) -> str:
     cmd = [
         "claude", "-p", user_prompt,
         "--allowedTools", "",
@@ -40,12 +43,32 @@ def _call_claude(system: str, user_prompt: str, model: str = None) -> str:
     if model:
         cmd += ["--model", model]
 
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=CALL_TIMEOUT_SECONDS)
+    # subprocess.run(..., timeout=...) blocks until the process exits with no way to
+    # interrupt it early, so Cancel couldn't actually stop a running call. Popen +
+    # a polling communicate() loop (an officially supported retry pattern -- see the
+    # subprocess docs on TimeoutExpired) lets us check cancel_event/the timeout every
+    # _POLL_INTERVAL and kill the process the moment either fires.
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    start = time.time()
+    while True:
+        try:
+            stdout, stderr = proc.communicate(timeout=_POLL_INTERVAL)
+            break
+        except subprocess.TimeoutExpired:
+            if cancel_event is not None and cancel_event.is_set():
+                proc.kill()
+                proc.communicate()
+                raise TranslationCancelled("cancelled by user")
+            if time.time() - start > CALL_TIMEOUT_SECONDS:
+                proc.kill()
+                proc.communicate()
+                raise subprocess.TimeoutExpired(cmd, CALL_TIMEOUT_SECONDS)
+
     if proc.returncode != 0:
-        raise TranslationError(f"claude exited {proc.returncode}: {proc.stderr.strip()[:500]}")
+        raise TranslationError(f"claude exited {proc.returncode}: {stderr.strip()[:500]}")
 
     try:
-        envelope = json.loads(proc.stdout)
+        envelope = json.loads(stdout)
     except json.JSONDecodeError as exc:
         raise TranslationError(f"could not parse claude's JSON envelope: {exc}") from exc
 
@@ -55,36 +78,14 @@ def _call_claude(system: str, user_prompt: str, model: str = None) -> str:
     return envelope.get("result", "")
 
 
-def translate_chunk(units: list, target_lang: str, model: str = None, source_lang: str = None):
+def translate_chunk(units: list, target_lang: str, model: str = None, source_lang: str = None,
+                     cancel_event=None):
     """Run one chunk through `claude -p`. Returns (translations, error): on
     success error is None; on repeated failure, translations falls back to
     the original (untranslated) HTML for each unit and error explains why --
-    the caller should log it but a bad chunk never has to fail the whole job."""
-    system = system_prompt(target_lang, source_lang)
-    user_prompt = json.dumps([u.html for u in units], ensure_ascii=False)
+    the caller should log it but a bad chunk never has to fail the whole job.
+    See translate_chunk_generic for the retry/auto-split/cancel behavior."""
+    def call_fn(system, user_prompt):
+        return _call_claude(system, user_prompt, model, cancel_event=cancel_event)
 
-    last_error = None
-    for attempt in range(MAX_RETRIES + 1):
-        try:
-            result_text = _call_claude(system, user_prompt, model)
-            translations = json.loads(strip_code_fence(result_text))
-            if isinstance(translations, list) and len(translations) == len(units):
-                if wrong_script_detected(translations, target_lang):
-                    last_error = TranslationError(
-                        f"response doesn't look like it's actually in {target_lang} "
-                        "(wrong script detected) -- retrying"
-                    )
-                else:
-                    return translations, None
-            else:
-                got = len(translations) if isinstance(translations, list) else type(translations).__name__
-                last_error = TranslationError(f"expected {len(units)} translations, got {got}")
-        except subprocess.TimeoutExpired as exc:
-            last_error = exc
-        except Exception as exc:  # subprocess/JSON errors, TranslationError, etc.
-            last_error = exc
-
-        if attempt < MAX_RETRIES:
-            time.sleep(2.0 * (attempt + 1))
-
-    return [u.html for u in units], last_error
+    return translate_chunk_generic(call_fn, units, target_lang, source_lang, cancel_event=cancel_event)

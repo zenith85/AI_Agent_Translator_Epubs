@@ -83,6 +83,7 @@ BANNER = r"""
 ENGINE_CHOICES = ["claude", "codex"]
 
 COMMON_LANGUAGES = [
+    "English",
     "Spanish",
     "French",
     "German",
@@ -216,8 +217,8 @@ def main():
                          help="Which CLI to translate with: claude or codex (omit to be asked)")
     parser.add_argument("-o", "--output", default="",
                          help="Output .epub path (default: <name>.<lang>.epub next to the source)")
-    parser.add_argument("--max-tokens-per-chunk", type=int, default=6000,
-                         help="Approx. input tokens packed per translation call (default: 6000)")
+    parser.add_argument("--max-tokens-per-chunk", type=int, default=3000,
+                         help="Approx. input tokens packed per translation call (default: 3000)")
     parser.add_argument("--model", default=None,
                          help="Model alias/name passed to the engine's CLI (default: its account's default model)")
     parser.add_argument("--concurrency", type=int, default=3,
@@ -288,7 +289,8 @@ def main():
                 completed += 1
                 if error is not None:
                     errors.append((index, error))
-                    print(f"[{completed}/{len(chunks)}] chunk {index} FAILED, kept original text: {error}")
+                    print(f"[{completed}/{len(chunks)}] chunk {index} had errors, "
+                          f"some text may have fallen back to the original: {error}")
                 else:
                     print(f"[{completed}/{len(chunks)}] chunk {index} translated")
 
@@ -296,7 +298,8 @@ def main():
         ok = len(chunks) - len(errors)
         print(f"Translated {ok}/{len(chunks)} chunk(s) successfully in {elapsed:.1f}s.")
         if errors:
-            print(f"{len(errors)} chunk(s) fell back to original text (see messages above).")
+            print(f"{len(errors)} chunk(s) had errors -- some of their text may have fallen back "
+                  "to the original (see messages above).")
     else:
         print("No translatable text found; writing the book through unchanged.")
 
