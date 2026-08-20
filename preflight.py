@@ -6,6 +6,7 @@ text vs. dialogs/labels) -- this module only checks and fixes, it doesn't print.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -44,6 +45,34 @@ def claude_login() -> dict:
     visible in the terminal that launched us) and returns the refreshed status."""
     subprocess.run(["claude", "auth", "login"])
     return claude_auth_status()
+
+
+def claude_usage_status() -> dict:
+    """There's no JSON API for plan usage -- `/usage` is a slash command whose
+    reply is prose, so this runs it through `claude -p` (same one-shot,
+    tool-less transport claude_driver.py uses for translation) and regexes
+    the percentages/reset times back out of the text."""
+    try:
+        proc = subprocess.run(
+            ["claude", "-p", "/usage", "--allowedTools", "", "--output-format", "json"],
+            capture_output=True, text=True, timeout=30,
+        )
+        envelope = json.loads(proc.stdout) if proc.stdout.strip() else {}
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
+        return {}
+    if envelope.get("is_error"):
+        return {}
+
+    text = envelope.get("result", "")
+    session_match = re.search(r"Current session:\s*(\d+)%\s*used(?:\s*\S\s*resets\s*(.+))?", text)
+    week_match = re.search(r"Current week[^:\n]*:\s*(\d+)%\s*used(?:\s*\S\s*resets\s*(.+))?", text)
+    return {
+        "session_pct": int(session_match.group(1)) if session_match else None,
+        "session_reset": (session_match.group(2) or "").strip() if session_match else "",
+        "week_pct": int(week_match.group(1)) if week_match else None,
+        "week_reset": (week_match.group(2) or "").strip() if week_match else "",
+        "raw": text,
+    }
 
 
 def is_codex_installed() -> bool:

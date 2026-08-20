@@ -239,6 +239,33 @@ class App:
         self.output_name_entry = tb.Entry(setup, textvariable=self.output_name_var)
         self.output_name_entry.grid(row=6, column=1, sticky="ew")
 
+        # Usage card: Claude Code's plan-usage percentages (session/week), pulled via
+        # `claude -p "/usage"` since there's no JSON API for it -- see
+        # preflight.claude_usage_status. Only meaningful for the claude engine.
+        usage = tb.Labelframe(sidebar, text="Usage", padding=14)
+        usage.pack(fill="x", pady=(0, 12))
+        usage.columnconfigure(1, weight=1)
+
+        tb.Label(usage, text="Session").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.session_usage_bar = tb.Progressbar(usage, mode="determinate", maximum=100, bootstyle="info")
+        self.session_usage_bar.grid(row=0, column=1, sticky="ew")
+        self.session_usage_label = tb.Label(usage, text="--", width=5, anchor="e")
+        self.session_usage_label.grid(row=0, column=2, padx=(6, 0))
+
+        tb.Label(usage, text="Week").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+        self.week_usage_bar = tb.Progressbar(usage, mode="determinate", maximum=100, bootstyle="info")
+        self.week_usage_bar.grid(row=1, column=1, sticky="ew", pady=(6, 0))
+        self.week_usage_label = tb.Label(usage, text="--", width=5, anchor="e")
+        self.week_usage_label.grid(row=1, column=2, padx=(6, 0), pady=(6, 0))
+
+        self.usage_reset_var = tk.StringVar(value="")
+        tb.Label(usage, textvariable=self.usage_reset_var, bootstyle="secondary",
+                 wraplength=260, justify="left").grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        self.usage_refresh_button = tb.Button(usage, text="Refresh", bootstyle="secondary-outline", width=8,
+                                                command=self._refresh_usage_async)
+        self.usage_refresh_button.grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
         # Drop zone -- uses inputbg/secondary rather than light/border: those two are
         # reliably distinct from the page background in both light and dark themes,
         # whereas border in particular is literally identical to bg in dark themes
@@ -415,6 +442,16 @@ class App:
         self._engine_ready = False
         self._update_translate_state()
 
+        if engine == "claude":
+            self.usage_refresh_button.config(state="normal")
+        else:
+            self.usage_refresh_button.config(state="disabled")
+            self.session_usage_bar.config(value=0)
+            self.week_usage_bar.config(value=0)
+            self.session_usage_label.config(text="--")
+            self.week_usage_label.config(text="--")
+            self.usage_reset_var.set("Usage stats are only available for the Claude Code engine.")
+
         if engine == "local_ai":
             self.login_button.grid_remove()
             self.engine_settings_button.grid()
@@ -439,6 +476,18 @@ class App:
                 self.msg_queue.put(("engine_status", (engine, "ok", detail)))
             else:
                 self.msg_queue.put(("engine_status", (engine, "not_logged_in", None)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _refresh_usage_async(self):
+        if self._engine_key() != "claude":
+            return
+        self.usage_refresh_button.config(state="disabled")
+        self.usage_reset_var.set("Checking...")
+
+        def work():
+            status = preflight.claude_usage_status()
+            self.msg_queue.put(("usage_status", status))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -853,6 +902,19 @@ class App:
             self._apply_chunk_result(index, translations, error)
         elif kind == "write_complete":
             pass
+        elif kind == "usage_status":
+            status = payload[0]
+            if self._engine_key() != "claude":
+                return  # stale check for an engine that's no longer selected
+            self.usage_refresh_button.config(state="normal")
+            session_pct, week_pct = status.get("session_pct"), status.get("week_pct")
+            self.session_usage_bar.config(value=session_pct or 0)
+            self.session_usage_label.config(text=f"{session_pct}%" if session_pct is not None else "--")
+            self.week_usage_bar.config(value=week_pct or 0)
+            self.week_usage_label.config(text=f"{week_pct}%" if week_pct is not None else "--")
+            resets = [f"{label} resets {status[key]}" for label, key in
+                      (("Session", "session_reset"), ("Week", "week_reset")) if status.get(key)]
+            self.usage_reset_var.set(" · ".join(resets) if resets else "Couldn't read usage.")
         elif kind == "error":
             self._loading = False
             self._update_translate_state()
@@ -867,6 +929,8 @@ class App:
                 self._engine_ready = True
                 self.engine_status_var.set(f"✓ {label}: logged in as {detail}" if detail else f"✓ {label}: logged in")
                 self.login_button.config(text=f"Log in to {label}", state="disabled", bootstyle="secondary-outline")
+                if engine == "claude":
+                    self._refresh_usage_async()
             elif status == "not_logged_in":
                 self._engine_ready = False
                 self.engine_status_var.set(f"{label}: not logged in")
