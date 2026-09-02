@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -31,6 +32,11 @@ from translation_common import (
 CALL_TIMEOUT_SECONDS = 300
 _POLL_INTERVAL = 0.2
 
+# See claude_driver._POPEN_KWARGS -- same reasoning: `codex` resolves to a
+# codex.cmd shim on Windows, which Windows would otherwise pop a new visible
+# console window for.
+_POPEN_KWARGS = {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}
+
 
 def _call_codex(full_prompt: str, model: str = None, cancel_event=None) -> str:
     fd, tmp_path = tempfile.mkstemp(prefix="codex_out_", suffix=".txt")
@@ -43,8 +49,16 @@ def _call_codex(full_prompt: str, model: str = None, cancel_event=None) -> str:
         # See claude_driver._call_claude for why this is a poll loop instead of a
         # single blocking subprocess.run(..., timeout=...): only a loop gives Cancel
         # a chance to actually kill the process instead of just waiting it out.
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                 stderr=subprocess.PIPE, text=True)
+        #
+        # encoding/errors are explicit for the same reason as claude_driver: `text=True`
+        # alone would encode/decode stdin/stdout/stderr with the OS's locale-preferred
+        # encoding (e.g. cp949 on Korean Windows) instead of UTF-8, which can silently
+        # crash subprocess's internal reader thread on non-ASCII content and leave the
+        # call hung.
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace", **_POPEN_KWARGS,
+        )
         start = time.time()
         pending_input = full_prompt  # communicate() only accepts input on its first call
         stderr = ""

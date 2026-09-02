@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import time
 
 from translation_common import (
@@ -26,6 +27,16 @@ from translation_common import (
 )
 
 CALL_TIMEOUT_SECONDS = 300
+
+# On Windows, `claude` resolves to a `claude.cmd` shim; launching it from a
+# console-less GUI process makes Windows auto-open a new visible console
+# window for it. CREATE_NO_WINDOW suppresses that. We also explicitly close
+# stdin (the call never needs input) so that if the CLI ever tries to prompt
+# for something interactive (e.g. a first-run workspace-trust confirmation),
+# it fails fast instead of hanging forever reading from a console nobody's
+# watching -- which otherwise looks exactly like a stuck translation that's
+# silently burning usage on repeated timeout-and-retry cycles.
+_POPEN_KWARGS = {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}
 
 # How often the poll loop below wakes up to check for cancellation/timeout while
 # `claude -p` is still running. Small enough that Cancel feels immediate, large
@@ -48,7 +59,18 @@ def _call_claude(system: str, user_prompt: str, model: str = None, cancel_event=
     # a polling communicate() loop (an officially supported retry pattern -- see the
     # subprocess docs on TimeoutExpired) lets us check cancel_event/the timeout every
     # _POLL_INTERVAL and kill the process the moment either fires.
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    # encoding/errors are explicit because `text=True` alone decodes with the OS's
+    # locale-preferred encoding (e.g. cp949 on Korean Windows) -- claude's actual
+    # output is UTF-8, and any translated character outside that locale's codepage
+    # would otherwise crash the decode inside subprocess's internal reader thread.
+    # That crash is swallowed silently (just a background-thread traceback), leaving
+    # stdout/stderr as None or the pipe undrained -- which can make the still-running
+    # claude process block forever on a full pipe, looking exactly like a hung
+    # translation that nonetheless already burned real usage server-side.
+    proc = subprocess.Popen(
+        cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace", **_POPEN_KWARGS,
+    )
     start = time.time()
     while True:
         try:

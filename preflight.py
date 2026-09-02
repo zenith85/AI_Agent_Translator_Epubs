@@ -27,6 +27,12 @@ CODEX_INSTALL_HINT = (
 
 EPUB_DEPS = [("bs4", "beautifulsoup4"), ("lxml", "lxml"), ("ebooklib", "EbookLib")]
 
+# Suppresses the console window Windows would otherwise pop up for these non-
+# interactive checks (claude/codex resolve to .cmd shims there). Not used for
+# claude_login()/codex_login(), which intentionally inherit the console since
+# those need to actually show the user an interactive login flow.
+_POPEN_KWARGS = {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}
+
 
 def is_claude_installed() -> bool:
     return shutil.which("claude") is not None
@@ -34,7 +40,8 @@ def is_claude_installed() -> bool:
 
 def claude_auth_status() -> dict:
     try:
-        proc = subprocess.run(["claude", "auth", "status"], capture_output=True, text=True, timeout=30)
+        proc = subprocess.run(["claude", "auth", "status"], capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", timeout=30, **_POPEN_KWARGS)
         return json.loads(proc.stdout) if proc.stdout.strip() else {}
     except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
         return {}
@@ -55,7 +62,7 @@ def claude_usage_status() -> dict:
     try:
         proc = subprocess.run(
             ["claude", "-p", "/usage", "--allowedTools", "", "--output-format", "json"],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, **_POPEN_KWARGS,
         )
         envelope = json.loads(proc.stdout) if proc.stdout.strip() else {}
     except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
@@ -85,7 +92,8 @@ def codex_login_status() -> dict:
     "email"} shape as claude_auth_status() so callers can treat both uniformly --
     Codex just never has an email, only a "detail" describing the auth method."""
     try:
-        proc = subprocess.run(["codex", "login", "status"], capture_output=True, text=True, timeout=30)
+        proc = subprocess.run(["codex", "login", "status"], capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", timeout=30, **_POPEN_KWARGS)
     except (subprocess.TimeoutExpired, OSError):
         return {}
     # Codex prints its status line to stderr, not stdout -- check both.
