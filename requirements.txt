@@ -3,4 +3,4 @@ lxml
 EbookLib
 tkinterdnd2
 tkinterweb
-ttkbootstrap
+sv-ttk

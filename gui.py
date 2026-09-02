@@ -39,11 +39,45 @@ import translation_common  # stdlib-only, safe to import before dependency check
 GUI_DEPS = [
     ("tkinterdnd2", "tkinterdnd2"),
     ("tkinterweb", "tkinterweb"),
-    ("ttkbootstrap", "ttkbootstrap"),
+    ("sv_ttk", "sv-ttk"),
 ] + preflight.EPUB_DEPS
 
-THEME = "superhero"
 APP_NAME = "INNO AI Agent Translator"
+
+# Sun Valley ships as the pip package `sv_ttk` (a plain ttk theme, applied via
+# sv_ttk.set_theme). Forest isn't on PyPI, so its .tcl + image assets are vendored
+# under themes/forest/ (from https://github.com/rdbende/Forest-ttk-theme, MIT) and
+# sourced directly with `root.tk.call("source", ...)`.
+FOREST_DIR = Path(__file__).resolve().parent / "themes" / "forest"
+
+THEME_OPTIONS = ["Sun Valley Light", "Sun Valley Dark", "Forest Light", "Forest Dark"]
+THEME_ENGINE = {
+    "Sun Valley Light": ("sv", "light"),
+    "Sun Valley Dark": ("sv", "dark"),
+    "Forest Light": ("forest", "light"),
+    "Forest Dark": ("forest", "dark"),
+}
+DEFAULT_THEME = "Sun Valley Light"
+
+# Raw (non-ttk) widgets -- the drop zone, the chunk-list canvas, the empty preview
+# page -- don't follow ttk theme switches automatically, so their colors are looked
+# up here per (engine, mode) instead of read off a live Style object. Matches each
+# theme's own background/foreground/accent so they blend in rather than clash.
+PALETTES = {
+    ("sv", "light"): dict(bg="#fafafa", fg="#1c1c1c", secondary="#6c757d", inputbg="#f0f0f0", border="#d5d5d5"),
+    ("sv", "dark"): dict(bg="#1c1c1c", fg="#fafafa", secondary="#9aa0a6", inputbg="#282828", border="#3a3a3a"),
+    ("forest", "light"): dict(bg="#ffffff", fg="#313131", secondary="#6c757d", inputbg="#f2f2f2", border="#d5d5d5"),
+    ("forest", "dark"): dict(bg="#313131", fg="#eeeeee", secondary="#a9a9a9", inputbg="#3a3a3a", border="#4a4a4a"),
+}
+
+# Status/semantic colors don't need to vary by engine, just by light/dark -- applied
+# as plain foreground tints (via custom-named ttk styles, e.g. "Done.TLabel") rather
+# than the colored "pill" badges ttkbootstrap did, since neither Sun Valley nor
+# Forest draw colored-background labels/buttons out of the box.
+STATUS_COLORS = {
+    "light": dict(queued="#6c757d", translating="#b8860b", done="#1e7d34", failed="#c0392b", cancelled="#6c757d"),
+    "dark": dict(queued="#9aa0a6", translating="#e0a63a", done="#66bb6a", failed="#e57373", cancelled="#9aa0a6"),
+}
 
 # claude/codex ride an existing CLI login (checked via preflight.ENGINES); local_ai has no
 # such thing -- it's a plain HTTP client against a URL/key the user configures themselves,
@@ -61,11 +95,11 @@ COMMON_LANGUAGES = [
 MAX_TOKENS_PER_CHUNK = 3000
 
 STATUS_LABELS = {
-    "queued": ("queued", "secondary"),
-    "translating": ("translating…", "warning"),
-    "done": ("done", "success"),
-    "failed": ("failed", "danger"),
-    "cancelled": ("cancelled", "secondary"),
+    "queued": ("queued", "Queued"),
+    "translating": ("translating…", "Translating"),
+    "done": ("done", "Done"),
+    "failed": ("failed", "Failed"),
+    "cancelled": ("cancelled", "Cancelled"),
 }
 
 
@@ -137,8 +171,6 @@ class App:
     def __init__(self, root):
         self.root = root
         self.root.title(APP_NAME)
-        self.root.geometry("1080x640")
-        self.root.minsize(860, 520)
 
         self.source_path = None
         self.msg_queue = queue.Queue()
@@ -160,16 +192,87 @@ class App:
         self.source_lang = ""
         self._write_lock = threading.Lock()
 
+        self._forest_loaded = set()  # which forest-<mode> .tcl files have been sourced already
+        self.theme_var = tk.StringVar(value=DEFAULT_THEME)
+        self._current_palette = self._apply_ttk_theme(*THEME_ENGINE[DEFAULT_THEME])
+
         self._build_ui()
+        self.theme_var.trace_add("write", lambda *_: self._on_theme_changed())
+
+        # Size the window to what its content actually needs rather than a fixed
+        # guess -- these two themes' own paddings run taller than ttkbootstrap's did,
+        # so a hardcoded geometry was clipping the bottom of the sidebar (Load Book,
+        # the progress bar) with no way to scroll down to it. minsize matches, so
+        # shrinking the window can't reintroduce that clipping; it can still grow.
+        # A full update() (not just update_idletasks()) so widgets are actually
+        # mapped before measuring -- some font/image metrics these two themes use
+        # only settle once realized on screen, and measuring too early under-reports
+        # by a few pixels, clipping the last row again. The small manual buffer on
+        # top covers whatever's still left after that.
+        self.root.update()
+        req_w, req_h = self.root.winfo_reqwidth(), self.root.winfo_reqheight() + 36
+        self.root.geometry(f"{req_w}x{req_h}")
+        self.root.minsize(req_w, req_h)
+
         self._poll_queue()
         self._check_engine_async(self._engine_key())
+
+    # ---- theme (Sun Valley / Forest) ----
+
+    def _load_forest_theme(self, mode: str):
+        if mode not in self._forest_loaded:
+            self.root.tk.call("source", str(FOREST_DIR / f"forest-{mode}.tcl"))
+            self._forest_loaded.add(mode)
+
+    def _apply_ttk_theme(self, family: str, mode: str) -> dict:
+        """Switches the active ttk theme, then (re)defines the small set of
+        semantic style names (Danger.TButton, DoneStatus.TLabel, etc.) this app
+        relies on -- ttk keeps style configuration per-theme, so it has to be
+        redone after every theme_use()/set_theme() call, not just once at
+        startup. Returns the raw-widget color palette for this theme."""
+        style = ttk.Style(self.root)
+        if family == "sv":
+            import sv_ttk
+            sv_ttk.set_theme(mode, root=self.root)
+        else:
+            self._load_forest_theme(mode)
+            style.theme_use(f"forest-{mode}")
+
+        status_colors = STATUS_COLORS[mode]
+        style.configure("Danger.TButton", foreground=status_colors["failed"])
+        for name, key in (("Queued", "queued"), ("Translating", "translating"), ("Done", "done"),
+                          ("Failed", "failed"), ("Cancelled", "cancelled")):
+            style.configure(f"{name}Status.TLabel", foreground=status_colors[key])
+
+        # Forest's own disabled-button foreground is the exact same gray as its
+        # disabled-button background in dark mode (#595959 on #595959) -- invisible
+        # text. Override with our own disabled tint on every theme so a disabled
+        # button never goes illegible, regardless of what the theme itself ships.
+        disabled_fg = "#707070" if mode == "light" else "#c8c8c8"
+        style.map("TButton", foreground=[("disabled", disabled_fg)])
+        style.map("Danger.TButton", foreground=[("disabled", disabled_fg)])
+
+        pal = PALETTES[(family, mode)]
+        style.configure("Muted.TLabel", foreground=pal["secondary"])
+        self._family, self._mode = family, mode
+        return pal
+
+    def _on_theme_changed(self):
+        family, mode = THEME_ENGINE[self.theme_var.get()]
+        pal = self._apply_ttk_theme(family, mode)
+        self._current_palette = pal
+        self.drop_frame.config(bg=pal["inputbg"], highlightbackground=pal["border"])
+        self.drop_label.config(bg=pal["inputbg"], fg=pal["secondary"])
+        self.chunks_canvas.config(bg=pal["bg"])
+        self.preview_container.config(highlightbackground=pal["border"])
+        self._preview_bg = pal["bg"]
+        if self.selected_chunk is None:
+            self._render_preview_empty()
 
     # ---- UI construction ----
 
     def _build_ui(self):
-        import ttkbootstrap as tb
-
-        colors = tb.Style().colors
+        pal = self._current_palette
 
         # Two-column layout: a fixed-width sidebar on the left holds the setup controls
         # (engine, login, from/to language, save-as) -- none of that needs to stretch
@@ -177,106 +280,65 @@ class App:
         # thing in a full-width row. The chunk list + preview -- the "chapters and
         # details" that actually grow with the book -- get the rest of the window on
         # the right, full height, instead of being squeezed into a strip at the bottom.
-        main = tb.Frame(self.root)
+        main = ttk.Frame(self.root)
         main.pack(fill="both", expand=True)
 
-        sidebar = tb.Frame(main, width=320, padding=(20, 20, 12, 20))
+        # No fixed width/pack_propagate(False) here -- the sidebar sizes itself to
+        # what its content actually needs (a Labelframe with a combobox, an entry,
+        # etc. all naturally want roughly the same width), so nothing inside it
+        # ever gets clipped by a container that was guessed too small.
+        sidebar = ttk.Frame(main, padding=(16, 14, 10, 14))
         sidebar.pack(side="left", fill="y")
-        sidebar.pack_propagate(False)
 
-        content = tb.Frame(main, padding=(8, 20, 20, 20))
+        content = ttk.Frame(main, padding=(6, 14, 14, 14))
         content.pack(side="left", fill="both", expand=True)
 
-        # Header
-        tb.Label(sidebar, text=APP_NAME, font=("", 16, "bold"),
-                 wraplength=280, justify="left").pack(anchor="w")
-        tb.Label(sidebar, text="Claude, Codex, or a local model -- formatting intact.",
-                 bootstyle="secondary", wraplength=280, justify="left").pack(anchor="w", pady=(2, 16))
+        header_row = ttk.Frame(sidebar)
+        header_row.pack(fill="x")
+        ttk.Label(header_row, text=APP_NAME, font=("", 16, "bold"),
+                  wraplength=230, justify="left").pack(side="left", anchor="n")
+        self.settings_button = ttk.Button(header_row, text="⚙", width=3, command=self._open_settings_dialog)
+        self.settings_button.pack(side="right", anchor="n")
 
-        # Setup card: engine (+ its status/login), language, output filename
-        setup = tb.Labelframe(sidebar, text="Setup", padding=14)
-        setup.pack(fill="x", pady=(0, 12))
-        setup.columnconfigure(1, weight=1)
-
-        tb.Label(setup, text="Engine").grid(row=0, column=0, sticky="w", padx=(0, 12), pady=(0, 8))
-        self.engine_var = tk.StringVar(value=ENGINE_LABELS["claude"])
-        self.engine_combo = tb.Combobox(setup, textvariable=self.engine_var, state="readonly",
-                                         values=[ENGINE_LABELS[k] for k in ENGINE_KEYS])
-        self.engine_combo.grid(row=0, column=1, sticky="ew", pady=(0, 8))
-        self.engine_var.trace_add("write", lambda *_: self._on_engine_changed())
-
-        self.engine_settings_button = tb.Button(setup, text="⚙", width=3, bootstyle="secondary-outline",
-                                                  command=self._open_local_ai_settings)
-        self.engine_settings_button.grid(row=0, column=2, padx=(6, 0), pady=(0, 8))
-        self.engine_settings_button.grid_remove()
-
-        self.engine_status_var = tk.StringVar(value="Checking...")
-        self.engine_status_label = tb.Label(setup, textvariable=self.engine_status_var,
-                                             bootstyle="secondary", wraplength=280, justify="left")
-        self.engine_status_label.grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 4))
-
-        self.login_button = tb.Button(setup, text="Log in", bootstyle="warning", command=self._start_login,
-                                       state="disabled")
-        self.login_button.grid(row=2, column=0, columnspan=3, sticky="w", pady=(0, 4))
-
-        tb.Separator(setup).grid(row=3, column=0, columnspan=3, sticky="ew", pady=8)
-
-        tb.Label(setup, text="From").grid(row=4, column=0, sticky="w", padx=(0, 12), pady=(0, 8))
-        self.source_lang_var = tk.StringVar(value=translation_common.AUTO_DETECT)
-        self.source_lang_combo = tb.Combobox(setup, textvariable=self.source_lang_var,
-                                              values=[translation_common.AUTO_DETECT] + COMMON_LANGUAGES)
-        self.source_lang_combo.grid(row=4, column=1, sticky="ew", pady=(0, 8))
-
-        tb.Label(setup, text="To").grid(row=5, column=0, sticky="w", padx=(0, 12), pady=(0, 8))
-        self.lang_var = tk.StringVar()
-        self.lang_combo = tb.Combobox(setup, textvariable=self.lang_var, values=COMMON_LANGUAGES)
-        self.lang_combo.grid(row=5, column=1, sticky="ew", pady=(0, 8))
-        self.lang_var.trace_add("write", lambda *_: self._on_language_changed())
-
-        tb.Label(setup, text="Save as").grid(row=6, column=0, sticky="w", padx=(0, 12))
-        self.output_name_var = tk.StringVar()
-        self._last_auto_name = ""
-        self.output_name_entry = tb.Entry(setup, textvariable=self.output_name_var)
-        self.output_name_entry.grid(row=6, column=1, sticky="ew")
+        ttk.Label(sidebar, text="Claude, Codex, or a local model -- formatting intact.",
+                  style="Muted.TLabel", wraplength=280, justify="left").pack(anchor="w", pady=(2, 10))
 
         # Usage card: Claude Code's plan-usage percentages (session/week), pulled via
         # `claude -p "/usage"` since there's no JSON API for it -- see
         # preflight.claude_usage_status. Only meaningful for the claude engine.
-        usage = tb.Labelframe(sidebar, text="Usage", padding=14)
-        usage.pack(fill="x", pady=(0, 12))
+        usage = ttk.Labelframe(sidebar, text="Usage", padding=10)
+        usage.pack(fill="x", pady=(0, 10))
         usage.columnconfigure(1, weight=1)
 
-        tb.Label(usage, text="Session").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        self.session_usage_bar = tb.Progressbar(usage, mode="determinate", maximum=100, bootstyle="info")
+        ttk.Label(usage, text="Session").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.session_usage_bar = ttk.Progressbar(usage, mode="determinate", maximum=100)
         self.session_usage_bar.grid(row=0, column=1, sticky="ew")
-        self.session_usage_label = tb.Label(usage, text="--", width=5, anchor="e")
+        self.session_usage_label = ttk.Label(usage, text="--", width=5, anchor="e")
         self.session_usage_label.grid(row=0, column=2, padx=(6, 0))
 
-        tb.Label(usage, text="Week").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
-        self.week_usage_bar = tb.Progressbar(usage, mode="determinate", maximum=100, bootstyle="info")
-        self.week_usage_bar.grid(row=1, column=1, sticky="ew", pady=(6, 0))
-        self.week_usage_label = tb.Label(usage, text="--", width=5, anchor="e")
-        self.week_usage_label.grid(row=1, column=2, padx=(6, 0), pady=(6, 0))
+        ttk.Label(usage, text="Week").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(5, 0))
+        self.week_usage_bar = ttk.Progressbar(usage, mode="determinate", maximum=100)
+        self.week_usage_bar.grid(row=1, column=1, sticky="ew", pady=(5, 0))
+        self.week_usage_label = ttk.Label(usage, text="--", width=5, anchor="e")
+        self.week_usage_label.grid(row=1, column=2, padx=(6, 0), pady=(5, 0))
 
         self.usage_reset_var = tk.StringVar(value="")
-        tb.Label(usage, textvariable=self.usage_reset_var, bootstyle="secondary",
-                 wraplength=260, justify="left").grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Label(usage, textvariable=self.usage_reset_var, style="Muted.TLabel",
+                  wraplength=250, justify="left").grid(row=2, column=0, columnspan=3, sticky="w", pady=(5, 0))
 
-        self.usage_refresh_button = tb.Button(usage, text="Refresh", bootstyle="secondary-outline", width=8,
+        self.usage_refresh_button = ttk.Button(usage, text="Refresh", width=8,
                                                 command=self._refresh_usage_async)
-        self.usage_refresh_button.grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        self.usage_refresh_button.grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
-        # Drop zone -- uses inputbg/secondary rather than light/border: those two are
-        # reliably distinct from the page background in both light and dark themes,
-        # whereas border in particular is literally identical to bg in dark themes
-        # (verified for "darkly": both #222222), which made the box invisible.
-        self.drop_frame = tk.Frame(sidebar, bg=colors.inputbg, highlightbackground=colors.secondary,
-                                    highlightthickness=1, height=88)
-        self.drop_frame.pack(fill="x", pady=8)
+        # Drop zone -- uses inputbg/border rather than bg/fg: those two are reliably
+        # distinct from the page background in both light and dark themes.
+        self.drop_frame = tk.Frame(sidebar, bg=pal["inputbg"], highlightbackground=pal["border"],
+                                    highlightthickness=1, height=76)
+        self.drop_frame.pack(fill="x", pady=6)
         self.drop_label = tk.Label(self.drop_frame, text="Drag an .epub file here, or click to browse",
-                                    bg=colors.inputbg, fg=colors.secondary, font=("", 11), cursor="hand2",
-                                    wraplength=270, justify="center")
-        self.drop_label.pack(expand=True, fill="both", pady=14)
+                                    bg=pal["inputbg"], fg=pal["secondary"], font=("", 11), cursor="hand2",
+                                    wraplength=260, justify="center")
+        self.drop_label.pack(expand=True, fill="both", pady=10)
         self.drop_label.bind("<Button-1>", lambda e: self._browse())
         self.drop_frame.bind("<Button-1>", lambda e: self._browse())
 
@@ -288,23 +350,23 @@ class App:
         except Exception:
             pass  # drag-and-drop unavailable; clicking to browse still works
 
-        self.translate_button = tb.Button(sidebar, text="Load Book", bootstyle="primary",
-                                           command=self._on_load_book, state="disabled")
-        self.translate_button.pack(fill="x", pady=(6, 10))
+        self.translate_button = ttk.Button(sidebar, text="Load Book", style="TButton",
+                                            command=self._on_load_book, state="disabled")
+        self.translate_button.pack(fill="x", pady=(4, 8))
 
-        self.progress = tb.Progressbar(sidebar, mode="determinate", bootstyle="primary")
+        self.progress = ttk.Progressbar(sidebar, mode="determinate")
         self.progress.pack(fill="x", pady=(0, 4))
 
         self.status_var = tk.StringVar(value="")
-        tb.Label(sidebar, textvariable=self.status_var, bootstyle="secondary",
-                 wraplength=280, justify="left").pack(anchor="w", fill="x", pady=(0, 8))
+        ttk.Label(sidebar, textvariable=self.status_var, style="Muted.TLabel",
+                  wraplength=280, justify="left").pack(anchor="w", fill="x", pady=(0, 4))
 
         # Chunk list (left) + rendered preview (right) -- "chapters and details" for
         # the loaded book, filling the entire right side of the window.
-        paned = tb.PanedWindow(content, orient="horizontal")
+        paned = ttk.PanedWindow(content, orient="horizontal")
         paned.pack(fill="both", expand=True)
 
-        chunks_container = tb.Frame(paned)
+        chunks_container = ttk.Frame(paned)
         paned.add(chunks_container, weight=2)
 
         # ttk.Panedwindow sizes each pane from its requested/natural size on first
@@ -312,9 +374,9 @@ class App:
         # resizes), and a bare Canvas has no natural width of its own -- without an
         # explicit width hint here the initial split can leave this pane too narrow
         # to fit a row's status badge and Retry button.
-        self.chunks_canvas = tk.Canvas(chunks_container, highlightthickness=0, bg=colors.bg, width=420)
-        chunks_scrollbar = tb.Scrollbar(chunks_container, orient="vertical", command=self.chunks_canvas.yview)
-        self.chunks_inner = tb.Frame(self.chunks_canvas)
+        self.chunks_canvas = tk.Canvas(chunks_container, highlightthickness=0, bg=pal["bg"], width=420)
+        chunks_scrollbar = ttk.Scrollbar(chunks_container, orient="vertical", command=self.chunks_canvas.yview)
+        self.chunks_inner = ttk.Frame(self.chunks_canvas)
         self.chunks_inner.bind(
             "<Configure>",
             lambda e: self.chunks_canvas.configure(scrollregion=self.chunks_canvas.bbox("all")),
@@ -336,9 +398,9 @@ class App:
         chunks_scrollbar.pack(side="right", fill="y")
         self._bind_scroll(self.chunks_canvas)
 
-        self.chunks_placeholder = tb.Label(
+        self.chunks_placeholder = ttk.Label(
             self.chunks_inner, text="Chunks will appear here once you click Translate.",
-            bootstyle="secondary", wraplength=260, justify="left",
+            style="Muted.TLabel", wraplength=260, justify="left",
         )
         self.chunks_placeholder.pack(padx=8, pady=8, anchor="w")
 
@@ -347,8 +409,26 @@ class App:
         # neutral light background), so it needs a clear frame around it in a dark
         # theme -- otherwise it looks like a stray rendering glitch instead of a
         # deliberate reading pane.
-        preview_container = tk.Frame(paned, highlightbackground=colors.secondary, highlightthickness=1)
-        paned.add(preview_container, weight=2)
+        self.preview_container = tk.Frame(paned, highlightbackground=pal["border"], highlightthickness=1)
+        paned.add(self.preview_container, weight=2)
+
+        # Prev/Next bar above the preview -- lets you page through chunks without
+        # hunting for them in the (potentially long) list on the left.
+        preview_nav = ttk.Frame(self.preview_container, padding=(8, 6))
+        preview_nav.pack(side="top", fill="x")
+
+        self.preview_prev_button = ttk.Button(preview_nav, text="◀ Previous", width=12,
+                                               command=lambda: self._navigate_chunk(-1),
+                                               state="disabled")
+        self.preview_prev_button.pack(side="left")
+
+        self.preview_chunk_label = ttk.Label(preview_nav, text="", style="Muted.TLabel", anchor="center")
+        self.preview_chunk_label.pack(side="left", fill="x", expand=True)
+
+        self.preview_next_button = ttk.Button(preview_nav, text="Next ▶", width=12,
+                                               command=lambda: self._navigate_chunk(1),
+                                               state="disabled")
+        self.preview_next_button.pack(side="right")
 
         from tkinterweb import HtmlFrame
         # width/height are just initial-layout hints (pack(fill="both", expand=True)
@@ -357,16 +437,106 @@ class App:
         # so with equal pane weights below, ttk.Panedwindow's deficit-splitting (equal
         # weight = equal absolute pixels trimmed from each pane's *requested* size, not
         # proportional) crushed the narrower chunk-list pane down to ~140px before this.
-        self.preview_frame = HtmlFrame(preview_container, messages_enabled=False, width=300, height=200)
+        self.preview_frame = HtmlFrame(self.preview_container, messages_enabled=False, width=300, height=200)
         self.preview_frame.pack(fill="both", expand=True)
         # Only tinted while empty -- once there's real translated content to show,
         # it switches to a plain light page (book text reads best that way), but an
         # unused panel showing stark white next to a dark theme looks like a bug.
-        self._preview_bg = colors.bg
+        self._preview_bg = pal["bg"]
         self._render_preview_empty()
 
+        self._build_settings_dialog()
+
+    def _build_settings_dialog(self):
+        """Theme + Setup (engine/login/languages/output name) live in their own
+        dialog, opened via the ⚙ button, rather than eating sidebar space that's
+        needed once a book is loaded. Built once and hidden (not destroyed) on
+        close, since background threads keep updating engine_status_label/
+        login_button/etc. regardless of whether the dialog is currently shown."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Settings")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        dialog.protocol("WM_DELETE_WINDOW", dialog.withdraw)
+        dialog.withdraw()  # built up front so its widgets exist, but hidden until opened
+
+        body = ttk.Frame(dialog, padding=14)
+        body.pack(fill="both", expand=True)
+
+        theme_row = ttk.Frame(body)
+        theme_row.pack(fill="x", pady=(0, 10))
+        ttk.Label(theme_row, text="Theme").pack(side="left")
+        self.theme_combo = ttk.Combobox(theme_row, textvariable=self.theme_var, state="readonly",
+                                         values=THEME_OPTIONS, width=15)
+        self.theme_combo.pack(side="right")
+
+        setup = ttk.Labelframe(body, text="Setup", padding=10)
+        setup.pack(fill="x")
+        setup.columnconfigure(1, weight=1)
+
+        ttk.Label(setup, text="Engine").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=(0, 6))
+        self.engine_var = tk.StringVar(value=ENGINE_LABELS["claude"])
+        self.engine_combo = ttk.Combobox(setup, textvariable=self.engine_var, state="readonly",
+                                          values=[ENGINE_LABELS[k] for k in ENGINE_KEYS])
+        self.engine_combo.grid(row=0, column=1, sticky="ew", pady=(0, 6))
+        self.engine_var.trace_add("write", lambda *_: self._on_engine_changed())
+
+        self.engine_settings_button = ttk.Button(setup, text="⚙", width=3,
+                                                  command=self._open_local_ai_settings)
+        self.engine_settings_button.grid(row=0, column=2, padx=(6, 0), pady=(0, 6))
+        self.engine_settings_button.grid_remove()
+
+        self.engine_status_var = tk.StringVar(value="Checking...")
+        self.engine_status_label = ttk.Label(setup, textvariable=self.engine_status_var,
+                                              style="Muted.TLabel", wraplength=260, justify="left")
+        self.engine_status_label.grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 4))
+
+        self.login_button = ttk.Button(setup, text="Log in", command=self._start_login, state="disabled")
+        self.login_button.grid(row=2, column=0, columnspan=3, sticky="w", pady=(0, 4))
+
+        ttk.Separator(setup).grid(row=3, column=0, columnspan=3, sticky="ew", pady=6)
+
+        ttk.Label(setup, text="From").grid(row=4, column=0, sticky="w", padx=(0, 10), pady=(0, 6))
+        self.source_lang_var = tk.StringVar(value=translation_common.AUTO_DETECT)
+        self.source_lang_combo = ttk.Combobox(setup, textvariable=self.source_lang_var,
+                                               values=[translation_common.AUTO_DETECT] + COMMON_LANGUAGES)
+        self.source_lang_combo.grid(row=4, column=1, sticky="ew", pady=(0, 6))
+
+        ttk.Label(setup, text="To").grid(row=5, column=0, sticky="w", padx=(0, 10), pady=(0, 6))
+        self.lang_var = tk.StringVar()
+        self.lang_combo = ttk.Combobox(setup, textvariable=self.lang_var, values=COMMON_LANGUAGES)
+        self.lang_combo.grid(row=5, column=1, sticky="ew", pady=(0, 6))
+        self.lang_var.trace_add("write", lambda *_: self._on_language_changed())
+
+        ttk.Label(setup, text="Save as").grid(row=6, column=0, sticky="w", padx=(0, 10))
+        self.output_name_var = tk.StringVar()
+        self._last_auto_name = ""
+        self.output_name_entry = ttk.Entry(setup, textvariable=self.output_name_var)
+        self.output_name_entry.grid(row=6, column=1, sticky="ew")
+
+        ttk.Button(body, text="Close", command=dialog.withdraw).pack(anchor="e", pady=(12, 0))
+
+        self.settings_dialog = dialog
+
+    def _open_settings_dialog(self):
+        self.settings_dialog.deiconify()
+        self.settings_dialog.lift()
+        self.settings_dialog.focus_force()
+
     def _bind_scroll(self, widget):
+        """Binding the wheel directly on `widget` only catches events when the
+        pointer is over that exact widget -- Tk doesn't bubble MouseWheel from
+        a child up to its parent, so hovering over any row's label/button/progress
+        bar (all children of the canvas's embedded frame) would do nothing. Instead
+        bind globally (low priority, fires after any widget-specific handling like
+        tkinterweb's own) and only act when the widget under the pointer is `widget`
+        or one of its descendants."""
         def on_wheel(event):
+            node = self.root.winfo_containing(event.x_root, event.y_root)
+            while node is not None and node is not widget:
+                node = node.master
+            if node is None:
+                return
             if getattr(event, "num", None) == 4:
                 widget.yview_scroll(-1, "units")
             elif getattr(event, "num", None) == 5:
@@ -374,9 +544,9 @@ class App:
             else:
                 widget.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
-        widget.bind("<MouseWheel>", on_wheel)
-        widget.bind("<Button-4>", on_wheel)
-        widget.bind("<Button-5>", on_wheel)
+        self.root.bind_all("<MouseWheel>", on_wheel, add="+")
+        self.root.bind_all("<Button-4>", on_wheel, add="+")
+        self.root.bind_all("<Button-5>", on_wheel, add="+")
 
     # ---- file selection ----
 
@@ -519,39 +689,37 @@ class App:
         self._update_translate_state()
 
     def _open_local_ai_settings(self):
-        import ttkbootstrap as tb
-
-        dialog = tb.Toplevel(self.root)
+        dialog = tk.Toplevel(self.root)
         dialog.title("Local AI settings")
         dialog.transient(self.root)
         dialog.grab_set()
         dialog.resizable(False, False)
 
-        form = tb.Frame(dialog, padding=16)
+        form = ttk.Frame(dialog, padding=16)
         form.pack(fill="both", expand=True)
         form.columnconfigure(1, weight=1, minsize=280)
 
-        tb.Label(form, text="Base URL").grid(row=0, column=0, sticky="w", pady=(0, 8), padx=(0, 12))
+        ttk.Label(form, text="Base URL").grid(row=0, column=0, sticky="w", pady=(0, 8), padx=(0, 12))
         base_url_var = tk.StringVar(value=self.local_ai_base_url)
-        tb.Entry(form, textvariable=base_url_var).grid(row=0, column=1, sticky="ew", pady=(0, 8))
+        ttk.Entry(form, textvariable=base_url_var).grid(row=0, column=1, sticky="ew", pady=(0, 8))
 
-        tb.Label(form, text="API Key").grid(row=1, column=0, sticky="w", pady=(0, 8), padx=(0, 12))
+        ttk.Label(form, text="API Key").grid(row=1, column=0, sticky="w", pady=(0, 8), padx=(0, 12))
         api_key_var = tk.StringVar(value=self.local_ai_api_key)
-        tb.Entry(form, textvariable=api_key_var, show="*").grid(row=1, column=1, sticky="ew", pady=(0, 8))
+        ttk.Entry(form, textvariable=api_key_var, show="*").grid(row=1, column=1, sticky="ew", pady=(0, 8))
 
-        tb.Label(form, text="Model").grid(row=2, column=0, sticky="w", pady=(0, 8), padx=(0, 12))
+        ttk.Label(form, text="Model").grid(row=2, column=0, sticky="w", pady=(0, 8), padx=(0, 12))
         model_var = tk.StringVar(value=self.local_ai_model)
-        model_combo = tb.Combobox(form, textvariable=model_var, values=[])
+        model_combo = ttk.Combobox(form, textvariable=model_var, values=[])
         model_combo.grid(row=2, column=1, sticky="ew", pady=(0, 8))
 
         test_status_var = tk.StringVar(value="")
-        tb.Label(form, textvariable=test_status_var, bootstyle="secondary",
-                 wraplength=360, justify="left").grid(row=3, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        ttk.Label(form, textvariable=test_status_var, style="Muted.TLabel",
+                  wraplength=360, justify="left").grid(row=3, column=0, columnspan=2, sticky="w", pady=(0, 8))
 
-        button_row = tb.Frame(form)
+        button_row = ttk.Frame(form)
         button_row.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
 
-        test_button = tb.Button(button_row, text="Test connection", bootstyle="info-outline")
+        test_button = ttk.Button(button_row, text="Test connection")
         test_button.pack(side="left")
 
         def do_test():
@@ -600,9 +768,8 @@ class App:
                 self._refresh_local_ai_status()
             dialog.destroy()
 
-        tb.Button(button_row, text="Save", bootstyle="primary", command=do_save).pack(side="right")
-        tb.Button(button_row, text="Cancel", bootstyle="secondary",
-                  command=dialog.destroy).pack(side="right", padx=(0, 8))
+        ttk.Button(button_row, text="Save", style="Accent.TButton", command=do_save).pack(side="right")
+        ttk.Button(button_row, text="Cancel", command=dialog.destroy).pack(side="right", padx=(0, 8))
 
     # ---- chunk list ----
 
@@ -615,6 +782,7 @@ class App:
         self.book = None
         self.chunks_placeholder.pack(padx=8, pady=8, anchor="w")
         self._render_preview_empty()
+        self._update_preview_nav()
 
     def _populate_chunks(self, raw_chunks, chunk_tokens):
         self.chunks_placeholder.pack_forget()
@@ -629,35 +797,33 @@ class App:
         self.chunks_canvas.itemconfig(self.chunks_window_id, width=self.chunks_canvas.winfo_width())
 
     def _build_chunk_row(self, chunk: "ChunkInfo"):
-        import ttkbootstrap as tb
-
-        row = tb.Frame(self.chunks_inner, padding=(8, 6))
+        row = ttk.Frame(self.chunks_inner, padding=(8, 6))
         row.pack(fill="x", padx=2, pady=1)
 
         # header is its own full-width frame (rather than packing the label/status/button
         # straight into row) so the progress bar below has a "cavity" to fill the whole
         # row's width -- packing side="left" widgets leaves only a slim strip next to them.
-        header = tb.Frame(row)
+        header = ttk.Frame(row)
         header.pack(fill="x")
 
-        info_label = tb.Label(header, text=f"Chunk {chunk.index}   ·   ~{chunk.tokens:,} tok",
-                               cursor="hand2", anchor="w")
+        info_label = ttk.Label(header, text=f"Chunk {chunk.index}   ·   ~{chunk.tokens:,} tok",
+                                cursor="hand2", anchor="w")
         info_label.pack(side="left", fill="x", expand=True)
         info_label.bind("<Button-1>", lambda e, c=chunk: self._select_chunk(c))
 
-        status_label = tb.Label(header, text="queued", bootstyle="secondary-inverse",
-                                 width=13, anchor="center")
+        status_label = ttk.Label(header, text="queued", style="QueuedStatus.TLabel",
+                                  width=13, anchor="center")
         status_label.pack(side="left", padx=(4, 8))
 
-        start_button = tb.Button(header, text="Start", bootstyle="outline-primary", width=7,
-                                  command=lambda c=chunk: self._on_start_chunk(c))
+        start_button = ttk.Button(header, text="Start", width=7,
+                                   command=lambda c=chunk: self._on_start_chunk(c))
         start_button.pack(side="left", padx=(4, 0))
 
-        cancel_button = tb.Button(header, text="Cancel", bootstyle="outline-danger", width=7,
-                                   command=lambda c=chunk: self._on_cancel_chunk(c), state="disabled")
+        cancel_button = ttk.Button(header, text="Cancel", style="Danger.TButton", width=7,
+                                    command=lambda c=chunk: self._on_cancel_chunk(c), state="disabled")
         cancel_button.pack(side="left", padx=(4, 0))
 
-        progress_bar = tb.Progressbar(row, mode="indeterminate", bootstyle="warning-striped")
+        progress_bar = ttk.Progressbar(row, mode="indeterminate")
 
         chunk.row_frame = row
         chunk.info_label = info_label
@@ -667,10 +833,10 @@ class App:
         chunk.progress_bar = progress_bar
 
     def _refresh_chunk_row(self, chunk: "ChunkInfo"):
-        text, style = STATUS_LABELS.get(chunk.status, (chunk.status, "secondary"))
+        text, style_key = STATUS_LABELS.get(chunk.status, (chunk.status, "Queued"))
         translating = chunk.status == "translating"
         if chunk.status_label is not None:
-            chunk.status_label.config(text=text, bootstyle=f"{style}-inverse")
+            chunk.status_label.config(text=text, style=f"{style_key}Status.TLabel")
         if chunk.start_button is not None:
             label = "Start" if chunk.status == "queued" else "Retry"
             busy = translating or self._loading
@@ -693,6 +859,29 @@ class App:
         if chunk.info_label is not None:
             chunk.info_label.config(font=("", 10, "bold"))
         self._render_chunk_preview(chunk)
+        self._update_preview_nav()
+
+    def _navigate_chunk(self, delta: int):
+        if not self.chunks:
+            return
+        if self.selected_chunk is None:
+            new_index = 0 if delta > 0 else len(self.chunks) - 1
+        else:
+            new_index = self.chunks.index(self.selected_chunk) + delta
+        if 0 <= new_index < len(self.chunks):
+            self._select_chunk(self.chunks[new_index])
+
+    def _update_preview_nav(self):
+        total = len(self.chunks)
+        if self.selected_chunk is None or total == 0:
+            self.preview_chunk_label.config(text="")
+            self.preview_prev_button.config(state="disabled")
+            self.preview_next_button.config(state="disabled")
+            return
+        index = self.chunks.index(self.selected_chunk)
+        self.preview_chunk_label.config(text=f"Chunk {index + 1} of {total}")
+        self.preview_prev_button.config(state="normal" if index > 0 else "disabled")
+        self.preview_next_button.config(state="normal" if index < total - 1 else "disabled")
 
     def _render_chunk_preview(self, chunk: "ChunkInfo"):
         self._render_preview_html(f"<html><body>{chunk.current_html()}</body></html>")
@@ -716,7 +905,11 @@ class App:
             and not self._any_chunk_busy()
             and self._engine_ready
         )
-        self.translate_button.config(state="normal" if ready else "disabled")
+        # Forest's Accent.TButton doesn't dim much when disabled, so the style itself
+        # (not just the state) has to carry "not ready yet" -- plain button while
+        # disabled, accent only once it's actually clickable.
+        self.translate_button.config(state="normal" if ready else "disabled",
+                                      style="Accent.TButton" if ready else "TButton")
 
     def _on_load_book(self):
         if self._loading or self._any_chunk_busy() or self.source_path is None:
@@ -928,27 +1121,25 @@ class App:
             if status == "ok":
                 self._engine_ready = True
                 self.engine_status_var.set(f"✓ {label}: logged in as {detail}" if detail else f"✓ {label}: logged in")
-                self.login_button.config(text=f"Log in to {label}", state="disabled", bootstyle="secondary-outline")
+                self.login_button.config(text=f"Log in to {label}", state="disabled", style="TButton")
                 if engine == "claude":
                     self._refresh_usage_async()
             elif status == "not_logged_in":
                 self._engine_ready = False
                 self.engine_status_var.set(f"{label}: not logged in")
-                self.login_button.config(text=f"Log in to {label}", state="normal", bootstyle="warning")
+                self.login_button.config(text=f"Log in to {label}", state="normal", style="Accent.TButton")
             elif status == "not_installed":
                 self._engine_ready = False
                 self.engine_status_var.set(preflight.ENGINES[engine]["cli_hint"])
-                self.login_button.config(text=f"Log in to {label}", state="disabled", bootstyle="secondary-outline")
+                self.login_button.config(text=f"Log in to {label}", state="disabled", style="TButton")
             self._update_translate_state()
 
 
 def main():
     _ensure_gui_deps()
     from tkinterdnd2 import TkinterDnD
-    import ttkbootstrap as tb
 
     root = TkinterDnD.Tk()
-    tb.Style(theme=THEME)
     App(root)
     root.mainloop()
 
